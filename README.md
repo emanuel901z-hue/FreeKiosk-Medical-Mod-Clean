@@ -72,7 +72,7 @@ im **Device Owner Mode**.
 ## Releases
 
 Fertige, installierbare APKs liegen als Pre-Release unter
-[Releases](https://github.com/emanuel901z-hue/KIOSK-TABS/releases):
+[Releases](https://github.com/emanuel901z-hue/FreeKiosk-Medical-Mod-Clean/releases):
 
 | Tag | APK-Asset | Inhalt |
 |---|---|---|
