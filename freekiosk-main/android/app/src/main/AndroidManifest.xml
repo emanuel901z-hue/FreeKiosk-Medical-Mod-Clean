@@ -1,0 +1,235 @@
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
+
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW"/>
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED"/>
+    <uses-permission android:name="android.permission.REORDER_TASKS"/>
+    <uses-permission android:name="android.permission.KILL_BACKGROUND_PROCESSES"/>
+    <uses-permission android:name="android.permission.REBOOT"
+        tools:ignore="ProtectedPermissions" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE"/>
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE"/>
+    <uses-permission android:name="android.permission.PACKAGE_USAGE_STATS"
+        tools:ignore="ProtectedPermissions" />
+    <uses-permission android:name="android.permission.CAMERA" />
+    <uses-permission android:name="android.permission.RECORD_AUDIO" />
+    <!-- Required by Chromium WebView for WebRTC audio capture: getUserMedia() relies on
+         AudioManager.setMode(MODE_IN_COMMUNICATION) which needs MODIFY_AUDIO_SETTINGS.
+         Without it, audio_manager_android.cc logs "Unable to select communication device"
+         and the JS side receives NotReadableError ("Could not start audio source"). -->
+    <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
+    <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
+    <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
+    <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" />
+    <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" />
+    <!-- Android 13+ granular media permissions for Media Player local file picker.
+         Removed in Play Store builds via src/playstore overlay (tools:node="remove"). -->
+    <uses-permission android:name="android.permission.READ_MEDIA_VIDEO" />
+    <uses-permission android:name="android.permission.READ_MEDIA_IMAGES" />
+    <uses-permission android:name="android.permission.QUERY_ALL_PACKAGES"
+        tools:ignore="QueryAllPackagesPermission" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <uses-permission android:name="android.permission.VIBRATE" />
+    <!-- Self-update: allows installing downloaded APK updates.
+         Removed entirely in Play Store builds via src/playstore overlay (tools:node="remove"). -->
+    <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+    <uses-permission android:name="android.permission.WRITE_SECURE_SETTINGS"
+        tools:ignore="ProtectedPermissions" />
+
+    <!-- Declare camera and audio as optional features -->
+    <uses-feature android:name="android.hardware.camera" android:required="false" />
+    <uses-feature android:name="android.hardware.camera.autofocus" android:required="false" />
+    <uses-feature android:name="android.hardware.microphone" android:required="false" />
+
+    <!-- Permissions pour la Status Bar -->
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
+    <uses-permission android:name="android.permission.BLUETOOTH" />
+    <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
+    <uses-permission android:name="android.permission.CHANGE_WIFI_STATE" />
+    <uses-permission android:name="android.permission.CHANGE_NETWORK_STATE" />
+    <uses-permission android:name="android.permission.NEARBY_WIFI_DEVICES"
+        tools:targetApi="tiramisu" />
+    <uses-permission android:name="android.permission.BLUETOOTH_ADMIN"
+        android:maxSdkVersion="30" />
+    <uses-permission android:name="android.permission.BLUETOOTH_SCAN"
+        android:usesPermissionFlags="neverForLocation"
+        tools:targetApi="s" />
+    <queries>
+        <intent>
+            <action android:name="android.intent.action.MAIN" />
+        </intent>
+        <intent>
+            <action android:name="android.intent.action.DIAL_EMERGENCY" />
+        </intent>
+        <intent>
+            <action android:name="com.android.phone.EmergencyDialer.DIAL" />
+        </intent>
+        <package android:name="com.android.phone" />
+    </queries>
+
+    <application
+      android:name=".MainApplication"
+      android:label="@string/app_name"
+      android:icon="@mipmap/ic_launcher"
+      android:roundIcon="@mipmap/ic_launcher_round"
+      android:allowBackup="false"
+      android:theme="@style/AppTheme"
+      android:supportsRtl="true"
+      android:networkSecurityConfig="@xml/network_security_config"
+      android:usesCleartextTraffic="true"
+      android:enableOnBackInvokedCallback="true">
+      
+      <!-- HomeActivity - Transparent launcher pour External App Mode -->
+      <activity
+        android:name=".HomeActivity"
+        android:label="@string/app_name"
+        android:theme="@android:style/Theme.Translucent.NoTitleBar"
+        android:launchMode="singleTask"
+        android:exported="true"
+        android:enabled="false">
+        <intent-filter android:priority="1000">
+            <action android:name="android.intent.action.MAIN" />
+            <category android:name="android.intent.category.HOME" />
+            <category android:name="android.intent.category.DEFAULT" />
+        </intent-filter>
+      </activity>
+
+      <!-- BootLockActivity - Lightweight native lock screen shown immediately on boot (#98) -->
+      <activity
+        android:name=".BootLockActivity"
+        android:label="@string/app_name"
+        android:theme="@android:style/Theme.NoTitleBar.Fullscreen"
+        android:launchMode="singleTask"
+        android:exported="false"
+        android:directBootAware="true"
+        android:configChanges="keyboard|keyboardHidden|orientation|screenLayout|screenSize|smallestScreenSize|uiMode"
+        android:resizeableActivity="false"
+        android:supportsPictureInPicture="false" />
+
+      <!-- MainActivity - Interface React Native principale -->
+      <activity
+        android:name=".MainActivity"
+        android:label="@string/app_name"
+        android:configChanges="keyboard|keyboardHidden|orientation|screenLayout|screenSize|smallestScreenSize|uiMode"
+        android:launchMode="singleTask"
+        android:windowSoftInputMode="adjustResize"
+        android:resizeableActivity="false"
+        android:supportsPictureInPicture="false"
+        android:exported="true">
+        <intent-filter>
+            <action android:name="android.intent.action.MAIN" />
+            <category android:name="android.intent.category.LAUNCHER" />
+        </intent-filter>
+        <intent-filter>
+            <action android:name="android.intent.action.MAIN" />
+            <category android:name="android.intent.category.HOME" />
+            <category android:name="android.intent.category.DEFAULT" />
+        </intent-filter>
+      </activity>
+
+      <!-- Device Admin Receiver pour le mode kiosk -->
+      <receiver
+        android:name=".DeviceAdminReceiver"
+        android:permission="android.permission.BIND_DEVICE_ADMIN"
+        android:exported="true">
+        <meta-data
+          android:name="android.app.device_admin"
+          android:resource="@xml/device_admin" />
+        <intent-filter>
+          <action android:name="android.app.action.DEVICE_ADMIN_ENABLED" />
+        </intent-filter>
+      </receiver>
+
+      <!-- Boot Receiver pour démarrage automatique -->
+      <receiver
+        android:name=".BootReceiver"
+        android:enabled="true"
+        android:exported="true"
+        android:directBootAware="true">
+        <intent-filter>
+          <action android:name="android.intent.action.BOOT_COMPLETED" />
+          <action android:name="android.intent.action.QUICKBOOT_POWERON" />
+          <action android:name="android.intent.action.REBOOT" />
+          <action android:name="android.intent.action.LOCKED_BOOT_COMPLETED" />
+          <category android:name="android.intent.category.DEFAULT" />
+        </intent-filter>
+      </receiver>
+
+      <!-- Service d'overlay pour bouton retour en mode External App -->
+      <service
+        android:name=".OverlayService"
+        android:enabled="true"
+        android:exported="false"
+        android:foregroundServiceType="specialUse">
+        <property
+          android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+          android:value="kiosk_overlay"/>
+      </service>
+
+      <!-- Service for monitoring keep-alive managed apps -->
+      <service
+        android:name=".BackgroundAppMonitorService"
+        android:enabled="true"
+        android:exported="false"
+        android:foregroundServiceType="specialUse">
+        <property
+          android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+          android:value="background_app_monitor"/>
+      </service>
+
+      <!-- Watchdog service: restarts FreeKiosk after OOM kill (#96) -->
+      <service
+        android:name=".KioskWatchdogService"
+        android:enabled="true"
+        android:exported="false"
+        android:foregroundServiceType="specialUse">
+        <property
+          android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+          android:value="kiosk_watchdog"/>
+      </service>
+
+      <!-- Anti-theft alarm service: plays alarm sound when device leaves allowed WiFi.
+           Runs in a separate process so the main app's WebView pauseMedia doesn't stop audio. -->
+      <service
+        android:name=".AlarmService"
+        android:enabled="true"
+        android:exported="false"
+        android:process=":alarm"
+        android:foregroundServiceType="specialUse">
+        <property
+          android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+          android:value="antitheft_alarm"/>
+      </service>
+
+      <!-- Receiver for silent installation results (disabled in Play Store builds) -->
+      <receiver
+        android:name=".UpdateInstallReceiver"
+        android:enabled="${updateReceiverEnabled}"
+        android:exported="true" />
+
+      <!-- Receiver for screen sleep scheduler alarms -->
+      <receiver
+        android:name=".ScreenSchedulerReceiver"
+        android:enabled="true"
+        android:exported="false" />
+
+      <!-- AccessibilityService pour injection clavier dans les apps externes
+           Disabled in Play Store builds (-Pplaystore) to avoid BIND_ACCESSIBILITY_SERVICE policy violation -->
+      <service
+        android:name=".FreeKioskAccessibilityService"
+        android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE"
+        android:enabled="${accessibilityServiceEnabled}"
+        android:exported="false">
+        <intent-filter>
+          <action android:name="android.accessibilityservice.AccessibilityService" />
+        </intent-filter>
+        <meta-data
+          android:name="android.accessibilityservice"
+          android:resource="@xml/accessibility_service_config" />
+      </service>
+
+    </application>
+</manifest>

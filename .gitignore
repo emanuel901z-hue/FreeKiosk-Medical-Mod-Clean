@@ -1,0 +1,54 @@
+# KIOSK-TABS — Root .gitignore
+# Projektspezifische Ergänzungen zum freekiosk-main/.gitignore
+
+# APKs — werden als GitHub Releases hochgeladen, nicht ins Repo committet
+*.apk
+*.aab
+
+# Backup-Dateien
+*-backup-*/
+*.bak
+
+# OS-spezifisch
+.DS_Store
+Thumbs.db
+
+# Editor / IDE
+.idea/
+*.swp
+*~
+
+# Temporäre Build-Logs
+gradle-build*.log
+
+# Gradle-Cache (ausgelagert auf D:, ~5 GB — niemals einchecken)
+.gradle-home/
+
+# Temporäre Build-Artifacts (Battery-Optimierung, etc.)
+bat_test/
+bat_opt/
+bat_dex/
+bat_opt_dex/
+jars/
+bat_test.jar
+bat_opt.jar
+settings.apk
+framework.jar
+services.jar
+ext.jar
+moto-settings.jar
+BatteryTest.java
+BatteryTest.class
+test_battery_methods.ps1
+test_battery_stop.ps1
+commit_battery.txt
+commit_msg.txt
+
+# Sensible / temporäre Dateien
+# .env.example wird bewusst versioniert (nur Platzhalter), .env/.env.local nie.
+.env
+.env.local
+*.tmp
+
+# Echte Zugangsdaten (Platzhalter in der Doku, Werte nur lokal)
+PRIVATE-CREDENTIALS.md

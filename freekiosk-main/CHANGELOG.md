@@ -1,0 +1,1094 @@
+﻿# Changelog
+
+
+All notable changes to FreeKiosk will be documented in this file.
+
+
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
+and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+***
+
+
+## [Unreleased]
+
+### Added
+- 🏠 **Opt-in "Set FreeKiosk as default launcher" mode** (#199): New Security → Auto Launch toggle (**off by default**) that makes FreeKiosk the Home/launcher app, so the **system itself** relaunches FreeKiosk at every boot. This addresses devices — Samsung/OneUI in particular — that **drop out of kiosk mode after a reboot or system update**: FreeKiosk's boot relaunch normally relies on OEM "Appear on top" / Autostart / background pop-up permissions, which Samsung **resets on major OS updates**, so the kiosk failed to come back. As the Home app, FreeKiosk is brought to the foreground by the system, with no dependency on those losable permissions. Two modes: **with Device Owner** the policy is **persistent and locked** (`addPersistentPreferredActivity`) — the user can't change it and it survives OS updates as long as Device Owner stays active (the standard Android Enterprise dedicated-device pattern); it is re-asserted on every app launch (self-healing after an update), cleared when the toggle is turned off, and cleared before Device Owner is relinquished, so the normal launcher is always restored. **Without Device Owner** the toggle opens the system Home-app picker so the user can select FreeKiosk manually (not enforced, and may be reset by an OS update — Device Owner makes it permanent). **Zero behavior change when off.** ⚠️ While on, FreeKiosk is the device launcher (no fallback if it crash-loops on launch), so test on one device before a fleet rollout. Reported by @23575437.
+
+- 🔐 **Opt-in "System screen-lock compatibility" mode** (#199): New Security → Auto Launch toggle (Device Owner only, **off by default**) for the rare case where a device has a **native Android screen-lock (PIN/password)** set *in addition* to FreeKiosk. Previously this combination could freeze/boot-loop the device: FreeKiosk's fast-boot-lock path (`BootLockActivity`, directBoot-aware) entered lock-task over the secure keyguard at `LOCKED_BOOT_COMPLETED` — before the user unlocks and credential-encrypted storage is available — fighting the lock screen and dead-locking the boot, while lock-task also suppressed the keyguard so the password "never took effect". When the new setting is enabled **and** a secure screen-lock is actually configured (`KeyguardManager.isDeviceSecure()`), FreeKiosk now defers to the secure keyguard at boot and starts normally at `BOOT_COMPLETED` (after the user unlocks), so the password works and there's no boot conflict. The flag is mirrored to device-encrypted storage so it's readable before unlock. **Zero behavior change when the toggle is off or no screen-lock is set** — every new code path is gated on both conditions. Note: a native screen-lock inherently requires entering the password on the device after every reboot before the kiosk starts (unsuitable for unattended fleets); the in-app warning makes this explicit. Reported by @23575437.
+
+### Fixed
+- ⬜ **Blank white screen after the WebView renderer process dies, with no recovery** (#198): When Android's Chromium renderer process for the content WebView was killed — typically an out-of-memory kill, which on long-running kiosks could be triggered by a heavy page such as a Home Assistant dashboard — FreeKiosk was left sitting on a dead/empty WebView surface (a blank white screen) until something manually remounted it (e.g. an MQTT/REST reload). The native `RNCWebViewClient.onRenderProcessGone` already returns `true` so the *app* process survives, but FreeKiosk had no `onRenderProcessGone` handler, and per Android's contract a WebView whose renderer is gone is defunct and must be remounted, not reused. Fixed by handling `onRenderProcessGone` in `WebViewComponent`: it best-effort clears the WebView cache (to rebuild the corrupted Chromium code-cache index that an OOM crash leaves behind) and asks `KioskScreen` to bump `webViewKey` for a full WebView remount — the same recovery pattern already used for inactivity return and the planner. A crash-loop guard backs off to a delayed remount if the renderer dies repeatedly in quick succession, so a page that crashes on every load cannot pin the CPU in a tight remount loop. Reported by @pantherale0.
+
+- 🧹 **Orphaned motion-detection interval after a rapid enable/disable** (#198, aside): `MotionDetector` starts capturing via a `setTimeout(…, CAMERA_READY_DELAY)` (1.5 s) that then arms the capture interval, but `stopDetection()` only cleared the interval — never the pending startup timeout. If motion detection was disabled or the camera restarted within that 1.5 s window (screensaver toggling motion on/off, returning from Settings after disabling motion, `isFocused` flipping quickly), the timeout still fired afterwards with a stale `enabled = true` closure and spun up an extra, untracked capture interval that ran until the next full cycle. Fixed by tracking the startup timer in a ref and clearing it in `stopDetection()` (both the vision-camera and Camera2 fallback paths). Reported by @pantherale0.
+
+- 🟦 **Per-app blocking overlays never appeared over the targeted app** (#199): A blocking-overlay region with a **Target App Package** set (e.g. `com.android.settings`, to mask part of an allowed app's UI in multi-app mode) never rendered — only regions left "always show" (empty target package) worked. Root cause: `BlockingOverlayManager` decides whether a region applies by comparing its `targetPackage` against the current foreground package, but `setForegroundPackage()` was never called from anywhere, so `currentForegroundPackage` stayed permanently `null` and every targeted region failed the match. Fixed by tracking the foreground app in `FreeKioskAccessibilityService.onAccessibilityEvent` (on `TYPE_WINDOW_STATE_CHANGED`) and forwarding the package to `BlockingOverlayManager`, so targeted regions now show/hide for the right app. Note: per-package targeting therefore requires FreeKiosk's Accessibility Service to be enabled; "always show" regions are unaffected. Reported by @23575437.
+
+## [1.2.20-beta.3] - 2026-06-25
+
+### Fixed
+- ⌨️ **"Return to Start Page on inactivity" fires while typing in a text field** (#195): In WebView mode the "Return to Start Page on inactivity" timer is reset by a `user-interaction` message that page-injected JavaScript posts on user activity. That message was only wired to pointer events (`click`, `scroll`, `touchstart`, `touchmove`, `touchend`) — typing with the on-screen keyboard produces **keyboard/input events instead**, so the timer kept counting down and could return the user to the start page mid-typing. It only appeared on "some fields on some sites" because some inputs incidentally emit touch/scroll events (autocomplete dropdowns, fields that scroll into view) which masked the gap. Fixed by also resetting the timer on `keydown`, `input`, and `compositionupdate` events (capture phase, sharing the existing 200 ms throttle). All three are needed because Android soft keyboards with predictive text fire `keydown` with `keyCode 229` and often skip per-character key events, while `input`/`compositionupdate` fire reliably for every character (including IME/autosuggest composition). Same-origin only — inputs inside cross-origin iframes remain unreachable from the injected script, as with every other interaction listener. Reported and fixed by @ShroomKing (#196).
+
+- 🔇 **Web page audio/video keeps playing in the background and becomes uncontrollable** (#177): With a web radio or video playing in WebView mode, the audio could keep going after the screensaver appeared, the screen turned off, or the app was backgrounded — and since FreeKiosk overrides the volume keys in kiosk mode, users (often elderly) had no way to stop it short of force-closing the app. Root cause: react-native-webview's `onHostPause()` is a no-op, so the Android WebView never pauses its media when the app is hidden, and FreeKiosk had no media-pause logic of its own; in "Keep Screen On" mode the screensaver is merely an overlay drawn on top of the still-running page, so the audio played on, unreachable underneath. Fixed by pausing the content WebView when the page is hidden: a new native `KioskModule.pauseWebView()/resumeWebView()` calls Android's `WebView.onPause()/onResume()` on the main WebView only (resolved by node handle, so the screensaver's own web/video screensaver is never affected), complemented by a JS-level pause of `<audio>`/`<video>` elements for reliability across OEM WebViews. Triggered on screensaver activation, screen-off, and app-background; the renderer resumes on return (media stays paused so nothing auto-restarts). Controlled by a new opt-in setting **Display → Web Media → "Pause audio/video when hidden"** (default on); turn it off to keep web audio playing continuously (e.g. an intentional web-radio dashboard). Reported by @dbee01.
+
+- 💥 **App crashes during motion detection when the camera view is torn down mid-capture** (`ViewNotFoundError`, reported on v1.2.19): With motion detection enabled, a periodic `camera.takePhoto()` runs in a background coroutine that first resolves the native `CameraView` by its view tag. If the camera view was unmounted between the call and its resolution (display-mode change, motion detection toggled off, screen teardown), `CameraViewModule.findCameraView()` threw `ViewNotFoundError`. This is distinct from the cameraless-device init crash fixed in #187: the exception was thrown *inside the UI-thread Handler callback* of `runOnUiThreadAndWait()` and never routed back to the suspended coroutine, so it escaped as an **uncaught exception on the main thread and crashed the whole app** — before the existing JS `try/catch` in `MotionDetector` (which already expects and swallows `findCameraView` errors) could ever see a promise rejection. Fixed in the `react-native-vision-camera` patch with two coordinated changes: (1) `runOnUiThreadAndWait()` now wraps the call and forwards failures to the coroutine via `continuation.resumeWith(Result.failure(e))` instead of throwing on the Handler thread; (2) `CameraViewModule.takePhoto()` now calls `findCameraView()` **inside** its `withPromise` block — necessary because the module's `backgroundCoroutineScope` has no exception handler, so without this the (now coroutine-level) exception would simply crash on the camera executor thread instead. With both, `takePhoto()` rejects cleanly and the existing JS handler absorbs it, so motion detection continues uninterrupted.
+
+- 💥 **App crashes with `IllegalArgumentException` when a custom User-Agent contains illegal characters** (reported on v1.2.19): If the custom User-Agent configured in Display settings contained a character that is illegal in an HTTP header value (e.g. a stray newline or control character from a copy-paste), Chromium's `AwSettings.setUserAgentString()` threw `IllegalArgumentException` — on the Fabric mount thread, so it crashed the whole app and could not be caught from JS. Fixed in the `react-native-webview` patch by guarding the User-Agent assignment in `RNCWebViewManagerImpl`: an invalid value is now logged and the WebView falls back to the default User-Agent instead of crashing.
+
+- 🔧 **ADB config silently ignored when only REST API / MQTT / option extras are provided** (#193): The documented `adb shell am start … --es rest_api_enabled "true" --es pin "1234"` command did nothing — no toast, no log, nothing applied. `handleAdbConfig()` bailed out early with a guard that only checked the four "content" extras (`lock_package`, `url`, `config`, `mqtt_broker_url`), returning `false` before it ever read the PIN or any of the ~25 individual option extras (REST API, MQTT, `status_bar`, `back_button_mode`, `screensaver_enabled`, `managed_apps`, …). So any config that set only those options was discarded. Fixed by treating the intent as an ADB config command when **any** recognized extra is present, not just the content keys. The previously required `--es config '{}'` workaround is no longer needed. Reported by @BoussonKarel.
+
+- 💥 **App crashes on launch with `IllegalArgumentException: Invalid task, not in foreground` when starting the kiosk lock task** (reported on v1.2.19): `MainActivity.onCreate()` calls `checkAndStartLockTask()` → `startLockTask()`, but `startLockTask()` requires the task to be the foreground task at that instant. When `onCreate()` runs while MainActivity is still backgrounded (boot, or the external-app-at-boot path that deliberately moves the task to back), the platform throws `IllegalArgumentException("Invalid task, not in foreground")`. In the Device Owner branch this was only wrapped in `catch (SecurityException)` — and `IllegalArgumentException` is not a `SecurityException`, so it escaped and crashed the app on launch. Fixed by routing every `startLockTask()` call through a new defensive `tryStartLockTask()` helper that catches the not-in-foreground failure (`IllegalArgumentException` / `IllegalStateException`) instead of crashing, flags the attempt as pending, and **retries once the activity actually gains window focus** (`onWindowFocusChanged(hasFocus = true)` — the most reliable foreground signal), so the kiosk lock still engages as soon as the app is genuinely in the foreground.
+
+- 💤 **Screensaver never activates in External App mode** (#190): With a screensaver + inactivity timer configured, the screensaver worked in WebView mode but never triggered once an external app was launched — and on devices with a short system screen timeout the OS locked the screen instead. Root cause: screensaver activation was driven by a JS `setTimeout`, but React Native freezes JS timers while the activity is backgrounded — and in External App mode FreeKiosk is backgrounded the whole time behind the launched app, so the timer never fired. Fixed (phase 1) by running the inactivity countdown **natively** in `OverlayService` (which already observes every tap via its watch-outside-touch overlay and keeps running in the background): on expiry it emits `inactivityExpiredNative`, and FreeKiosk runs the exact same activation path (motion pre-check → bring-to-front → screensaver) it used before. The native timer re-arms on each tap and on screensaver dismissal, and is disarmed during the motion pre-check, while the screensaver is active, and during scheduled sleep so it cannot double-fire. The JS timer still drives WebView/media modes unchanged. By design, External App mode delegates screen on/off to the system (FreeKiosk's "Keep Screen On" override is WebView/media only), so the screensaver only appears before the OS turns the screen off if the Android screen timeout is ≥ the inactivity delay (or "Never"); an info hint explaining this was added to the Screensaver settings section in External App mode. Reported by @elcomandante.
+
+- 🔔 **Notification panel and status bar stop working after a reboot in multi-app mode** (#191): When the notification panel / status bar were enabled, they worked until the device was rebooted, then became unavailable. Root cause: the lock-task features are applied in two stages — `BootLockActivity` starts the lock task at boot with `GLOBAL_ACTIONS` only, relying on `MainActivity.enableKioskRestrictions()` to upgrade to `NOTIFICATIONS` / `SYSTEM_INFO` afterwards. In multi-app mode an external app takes the foreground at boot while MainActivity stays backgrounded, so that upgrade was delayed or never applied — the kiosk stayed stuck on the boot-time `GLOBAL_ACTIONS`-only state with notifications and status bar disabled. Fixed by having `BootLockActivity` read the same settings (`@kiosk_allow_notifications`, `@kiosk_allow_system_info`, `@kiosk_allow_power_button`) and apply the full feature set directly at boot. Also fixed a related bug in `AppLauncherModule`: it enabled `LOCK_TASK_FEATURE_NOTIFICATIONS` without `LOCK_TASK_FEATURE_HOME`, which Android requires together — the missing flag made `setLockTaskFeatures()` throw and silently abort the entire feature update when launching an external app. (Note: on some OEM ROMs a separate "background pop-up / display floating window" permission may also need to be granted for the kiosk to relaunch correctly at boot.) Reported by @23575437.
+
+- ⌨️ **Soft keyboard stays visible when the screensaver activates** (#135): In "Keep Screen On" mode the screensaver draws an overlay (dim/URL/video) *on top* of the page while the screen stays physically on — so `ACTION_SCREEN_OFF` never fires and the screen-off keyboard-dismiss (added in #135 v1.2.19) never ran. The follow-up attempt added `Keyboard.dismiss()` at screensaver activation, but that is React Native's API and only closes keyboards owned by RN `TextInput`s; a keyboard raised by an `<input>` **inside the WebView** (e.g. a web login field in Force Numeric mode) was untouched and stayed visible behind the screensaver. Fixed by dismissing the keyboard at the **window level** via `InputMethodManager.hideSoftInputFromWindow()` + `clearFocus()` (new native `KioskModule.hideKeyboard()`), which closes the keyboard regardless of whether it belongs to a WebView or a RN view. Triggered from a `useEffect` on screensaver activation so it covers every activation path (inactivity timer, motion pre-check, MQTT/REST screen-off, scheduled sleep). The screen-off path (`ScreenStateReceiver`) now shares the same helper (`KeyboardUtils`). Reported by @asfreitas17.
+
+
+## [1.2.20-beta.2] - 2026-06-19
+
+### Fixed
+- 💥 **App crashes immediately on launch on cameraless x86 devices (BlissOS / Surface Go 2)** (#187): On devices whose camera service returns `null` from `CameraManager.getCameraIdList()` (e.g. BlissOS x86_64 desktop builds with no camera HAL), react-native-vision-camera's `CameraDevicesManager` threw a `NullPointerException` while building its availability callback. Because the module is instantiated eagerly during TurboModule initialization, this aborted the whole React instance and crashed the app on first launch — before any settings could load. Added a patch-package patch (`react-native-vision-camera+4.7.3.patch`) wrapping that call so a null camera list is treated as "no cameras" instead of crashing. Camera features are simply unavailable on such devices; the app now launches normally.
+
+- 🔓 **Stuck in kiosk with no way back to settings when the page fails to load** (#180): In WebView mode the normal N-tap-to-settings gesture relies on JavaScript injected into the page, so when the page can't load (server down, Wi-Fi not yet up after a reboot, HTTP error) no taps were ever reported and the user was stranded. Two fixes: (1) the error overlay — with its fallback ⚙️ settings button — now appears for **any** main-document HTTP error code, regardless of the auto-reload setting (previously only for 5xx with auto-reload on), while sub-resource errors (favicons, scripts…) are correctly ignored; (2) the fallback ⚙️ button now counts toward the N-tap sequence in **every** return mode, not just "tap anywhere"; (3) in WebView/media `tap_anywhere` mode the N-tap gesture is now **also detected natively** in `MainActivity.dispatchTouchEvent()`, independently of the page's injected JavaScript — so the escape still works when the page routes touches into a cross-origin iframe or the OEM WebView never delivers `touchend` to our listener (the page loads fine but in-page taps were lost). Active by default, gated to the kiosk screen only (never fires while inside Pin/Settings) in WebView/media + tap_anywhere mode, and disableable via the `@kiosk_tap_to_settings_native_enabled` flag. The hardware Volume-Up ×5 shortcut remains the JS-independent escape hatch, now likewise scoped to the kiosk screen so it can't kick the user out of Pin/Settings.
+
+- 🩹 **`npm install` fails with "Failed to apply patch for package react-native-webview"** (#184): The `react-native-webview` patch had corrupted hunk headers — its `@@ -a,b +c,d @@` line counts no longer matched the hunk bodies. This was introduced when the SSL-redirect fix (#144) was hand-edited into the patch without recomputing the counts. patch-package 8 rejects such patches with a "hunk header integrity check failed" error (which it surfaces as the generic "could not be parsed"), aborting `postinstall` on every platform. Fixed by regenerating the patch from source so the headers are correct. Also hardened `.gitattributes` with a `*.patch text eol=lf` rule so patch files keep LF line endings on Windows checkouts.
+
+- 🔍 **WebView zoom now scales the full page layout, not just text** (#188): The zoom setting previously used Android's `textZoom` which only scaled text size, causing card contents in Home Assistant dashboards to overflow their containers. Zoom now applies a CSS `zoom` property on the root element, scaling text, images, and layout containers uniformly.
+
+- 🔍 **New "Home Assistant" zoom mode that re-flows dashboards** (#188): Zooming `<html>` (the "Standard" mode) enlarged Home Assistant card *contents* without resizing the cards, so they overflowed. HADashboard avoids this by applying CSS `zoom` to `document.body` instead — HA measures its card layout from the body, so zooming the body makes the dashboard re-flow its columns and fill the screen. Added a **Zoom mode** selector under Display → Web Page Zoom: *Standard* (zooms `<html>`, unchanged default) and *Home Assistant* (zooms `<body>`, matching HADashboard's method). Opt-in, since a few non-HA sites may render differently.
+
+
+- 🔄 **Black screen / stuck on "Starting kiosk…" after reboot in Device Owner mode** (#176): Regression introduced in v1.2.20 (#172 fix). `setScreenCaptureDisabled(adminComponent, true)` was called between `setLockTaskPackages()` and `startLockTask()`. On Android 12+ devices (Lenovo, Samsung, KTC), this DPM call triggers a window policy change mid-sequence that disrupts lock task startup, leaving `BootLockActivity` stuck and `MainActivity` unable to take over. Fixed by moving `setScreenCaptureDisabled` to after `startLockTask()` so the lock task session is fully established first.
+
+- 💤 **Screensaver toggle resets to off after saving settings in External App mode** (#179): When display mode is set to External App, saving settings always forced `screensaverEnabled` to `false`, overwriting the user's choice. The screensaver save was correctly moved to apply to all display modes in a prior commit, but the old force-disable in the External App branch was never removed. Deleted the stale override.
+
+- 🔆 **MQTT `screenOn` command not working after `screenOff` in Device Owner mode** (#181): When Device Owner is active, `lockNow()` suspends the React Native JS thread, so MQTT commands routed through the JS event bridge were silently dropped. `screenOn` and `screenOff` are now handled natively in the MQTT command handler (same path as the REST API), bypassing the JS bridge entirely. Screen control logic has been extracted into a shared `ScreenController` object used by both MQTT and REST.
+
+***
+
+
+## [1.2.20] - 2026-06-03
+
+### Added
+- 🎨 **Status bar light/dark theme** (#118): A new "Status Bar Theme" toggle (Light / Dark) is now available in Settings → Display → Status Bar. In Dark mode (default), the status bar renders with white icons on a dark background — suitable for kiosks with dark web content. In Light mode, icons are black on a transparent/light background — suitable for kiosks with white or bright web content. All icons (battery, Wi-Fi, Bluetooth, volume, clock) are now rendered with `MaterialCommunityIcons` replacing the previous emoji characters, for consistent sizing, alignment, and color control across Android versions.
+
+- 🎙️ **Voice selection for Web Speech API TTS polyfill** (#169): The `speechSynthesis.getVoices()` polyfill now returns the actual list of installed Android TTS voices instead of an empty array. Web apps that select a specific voice via `utterance.voice = voices.find(v => v.name === '...')` will have that voice applied natively. REST API: `POST /api/tts` now accepts an optional `voiceUri` parameter to select a voice by URI for a single speak call. The available voice list is pre-cached at startup for performance (`cacheTtsVoices()`) and refreshed on demand.
+
+### Fixed
+- 🔐 **SSL certificate dialog not shown for initial navigation and same-host redirects** (#144): The custom SSL certificate acceptance dialog (Settings → General → Accept Self-Signed Certificates) only appeared when the failing URL exactly matched the currently loaded page URL. This excluded two common cases: (1) **initial navigation** — when the app launches and loads the first page, there is no currently loaded URL, so the dialog was never shown; (2) **HTTP→HTTPS redirects** — a redirect from `http://host/` to `https://host/` produces the same host but a different URL, which the string equality check rejected. Fixed by replacing the URL equality check with a `isMainFrameRequest()` helper that matches on same-host (regardless of scheme or path), and treating a null/empty current URL as a main-frame request. Sub-resource SSL errors (images, fonts, iframes from third-party domains) are still silently denied to avoid flooding the user with dialogs.
+
+- 📺 **MQTT/REST `screenOn` / `screenOff` commands did not physically lock the screen** (#155): `POST /api/screen/on` and `POST /api/screen/off` (and their MQTT equivalents) only activated or deactivated the screensaver overlay — they never called `lockNow()` to actually turn off the display. As a result, the MQTT `screenOn` status field stayed `true` even after sending `screenOff`. Fixed by delegating both commands to `KioskModule.turnScreenOff()` / `KioskModule.turnScreenOn()`, which call `lockNow()` and `wakeUp()` respectively. `screenOn` additionally calls `setIsScreensaverActive(false)` + `resetTimer()` to handle the case where only the overlay was active and no physical lock event fires.
+
+- 🏠 **Dashboard mode returned to grid when tile page self-refreshes** (#159): If the "Return to Start Page on Inactivity" feature was enabled, opening a dashboard tile armed the inactivity return timer. Pages that auto-refresh (e.g. Immich kiosk, Home Assistant dashboards) did not reset the timer because `Reset on Navigation` was off by default — so the timer fired after the configured delay and returned to the dashboard grid without any user interaction. Fixed: in dashboard mode, any page navigation (including self-refresh) always resets the inactivity timer, matching the user expectation that an actively-updating page should not be treated as "inactive."
+
+- 🌙 **Overnight rules rejected by Scheduled URLs** (#157): Recurring scheduled URL events with an end time before the start time (e.g. 22:00–07:00) were rejected with "End time must be after start time". Two fixes: (1) The validation in `RecurringEventEditor` now only rejects identical start/end times — crossing midnight is valid. (2) `isEventActive()` in `planner.ts` now detects overnight ranges (`startTime > endTime`) and handles the two sub-cases: before midnight (today is a scheduled day and `currentTime >= startTime`) and after midnight (yesterday was a scheduled day and `currentTime < endTime`). This correctly handles the case where an event starts Monday at 22:00 and is still active Tuesday at 06:30.
+
+- 📐 **Multi-app grid tile widths cut off after device rotation** (#160): In External App mode with multiple managed apps, the app grid used `Dimensions.get('window').width` to calculate tile widths. `Dimensions` returns stale values after device rotation until the component re-renders, causing tiles to overflow or be cut off. Fixed by replacing `Dimensions` with the `useWindowDimensions()` hook, which updates reactively on orientation change.
+
+- 🎙️ **WebRTC microphone audio silent due to missing permission** (#147): The `MODIFY_AUDIO_SETTINGS` permission was not declared in `AndroidManifest.xml`. This permission is required on Android for WebRTC to switch the audio mode to `MODE_IN_COMMUNICATION` (which activates the microphone path and echo cancellation). Without it, getUserMedia() succeeded but microphone audio was silent in WebRTC calls. Added as a normal protection level permission (auto-granted at install, no runtime prompt needed).
+
+- 🌐 **REST API returns "Endpoint not found" for valid endpoints when called with POST** (#146): Read-only endpoints (`/api/status`, `/api/health`, `/api/info`, `/api/battery`, etc.) only accepted GET requests. Automation tools that default to POST (Home Assistant REST integration, curl `--request POST`, Node-RED HTTP node, etc.) got a misleading `404 Endpoint not found` response even though the endpoint exists — the wrong HTTP method was the only issue. Fixed by making all read-only status endpoints accept both GET and POST. The two endpoints that have both a read and write variant (`/api/brightness`, `/api/volume`) now use the HTTP method to disambiguate: GET reads the current value, POST with a body sets it. POST-only control endpoints that require a JSON body (`/api/url`, `/api/tts`, etc.) now return a proper `405 Method Not Allowed` with a clear message when called with GET, instead of the generic 404.
+
+- 💾 **Export backup fails with "Permission denied" on Android 10+** (#166): `exportBackup()` wrote directly to `/storage/emulated/0/Download/` via `RNFS.writeFile()`. On Android 10+ (API 29+), `WRITE_EXTERNAL_STORAGE` is deprecated and silently denied, causing an EACCES crash. Fixed by switching the export flow to the Storage Access Framework: tapping Export now opens the system "Save As" dialog (`ACTION_CREATE_DOCUMENT`) where the user picks the save location. The file is then written via `ContentResolver.openOutputStream()` — no storage permission needed, works on all Android versions. The backup data collection logic is unchanged; only the write path changed. A new `saveJsonFile(content, filename)` method was added to `FilePickerModule` (Kotlin + TypeScript) to handle the SAF save dialog.
+
+- 🔇 **Audio from previous scheduled URL continues playing after planner switches to next URL** (#158): When the URL planner transitioned between scheduled events, it called `setUrl()` to navigate the WebView to the new URL — but the previous page's JavaScript (including Web Audio, HTML5 `<audio>`, timers) kept running in the background because the same WebView instance was reused. Fixed by incrementing `webViewKey` on each planner URL transition, which forces React to fully unmount and remount the WebViewComponent. The underlying Android WebView is destroyed, terminating all background sessions. The same remount is applied when the planner reverts to the base URL at the end of a scheduled period.
+
+- 📸 **Screenshot key combination (Power + Volume Down) not disabled in kiosk mode** (#172): On Android, pressing Power + Volume Down takes a screenshot even when Device Owner lock task mode is active. Fixed by calling `DevicePolicyManager.setScreenCaptureDisabled(true)` when entering kiosk mode (Device Owner only), and re-enabling it on exit. Prevents both the screenshot itself and the screenshot toolbar/preview from appearing over kiosk content.
+
+- 🔄 **Auto-reload does not trigger on HTTP 5xx errors (e.g. 504 Gateway Timeout)** (#173): The "Reload on Error" feature only handled network-level failures (no connectivity, DNS failure) via `onError`. HTTP error responses like 504 Gateway Timeout are delivered via `onHttpError` and were only logged — no reload was triggered. Fixed by extending `handleHttpError` to apply the same 5-second auto-reload for any HTTP 5xx status code when "Reload on Error" is enabled.
+
+- 💾 **Custom User Agent not included in backup/restore** (#174): The `@kiosk_custom_user_agent` storage key was missing from the backup key list in `BackupService`. Exporting and re-importing a configuration would silently drop the Custom User Agent setting. Added to the backup keys list.
+
+- ⌨️ **Soft keyboard remains visible when screensaver activates in URL/Video/Image mode** (#135): The existing fix (v1.2.19) dismissed the keyboard on `ACTION_SCREEN_OFF`, which only fires in Dim Only screensaver mode. In URL, Video, and Image screensaver modes the screen stays on — no `SCREEN_OFF` event fires — so the keyboard was never dismissed. Fixed by calling `Keyboard.dismiss()` at both screensaver activation paths in `KioskScreen`.
+
+
+***
+
+
+## [1.2.19] - 2026-05-31
+
+### Added
+- 🌙 **Customizable screensaver content** (#47, #91, #61): The screensaver is no longer just a brightness dimmer. A new "Screensaver Style" selector in Settings → Display → Screensaver offers three modes: **Dim Only** (default, unchanged — just dims the brightness), **Web Page** (displays a read-only URL fullscreen — clock, dashboard, HTML; tap anywhere to wake), and **Video / Image** (plays a video/image playlist via the existing MediaPlayerComponent with loop, mute, fit modes). In URL and Video modes the current brightness is preserved (auto-brightness keeps working), so the screen stays visible and Android no longer turns it off — addressing wall-mounted panel use cases. Existing users are unaffected: defaults remain Dim Only. A warning is shown in settings if Screensaver Brightness is below 10% while URL/Video is selected.
+
+- 🔐 **HTTP Basic Auth for WebView** (#113): FreeKiosk now automatically responds to HTTP 401 authentication challenges using credentials configured in Settings → General → Website Authentication. Enter a username and password; the password is stored in the Android Keychain (never in plain text). Leave the username empty to disable. Implemented via the `basicAuthCredential` prop of `react-native-webview`, which hooks into `WebViewClient.onReceivedHttpAuthRequest` natively — no JavaScript injection required and no impact on sites that don't use Basic Auth.
+
+- 🔀 **Switch display mode via REST/MQTT (`setMode`)** (#76): A new `setMode` command allows switching between WebView mode and External App mode at runtime without restarting FreeKiosk. Send `{"mode":"webview","url":"https://..."}` to switch to WebView (the `url` field is optional), or `{"mode":"external_app","package":"com.app.name"}` to launch an app and activate the return overlay. Available via REST (`POST /api/mode`) and MQTT (`set/mode`). The transition is clean in both directions: switching to WebView stops the OverlayService and background monitor; switching to External App reads fresh overlay settings from storage to avoid stale closures, verifies the app is installed, starts the OverlayService, then launches the app.
+
+- 🎯 **Motion detection sensitivity setting** (#125): A new "Sensitivity" radio group (Low / Medium / High) is now visible in Settings → Display → Screensaver → Motion Detection when motion detection is enabled. Previously the sensitivity was hardcoded to Medium. Low sensitivity requires larger movements to trigger (15% pixel change threshold), Medium is the default (8%), and High reacts to subtle movements (4%). The selected value is persisted and applied immediately to the camera-based motion detector.
+
+- 🏠 **FreeKiosk can be set as the default home launcher** (#127): `MainActivity` now declares the `HOME` / `DEFAULT` intent categories alongside `LAUNCHER`. This makes FreeKiosk appear in the Android "Choose home app" picker and allows `adb shell cmd package set-home-activity "com.freekiosk/.MainActivity"` to succeed. Previously the command failed because no HOME intent-filter was declared on the main activity. This is optional — FreeKiosk only becomes the default launcher if the user (or ADB) explicitly selects it.
+
+- 🔁 **Keep Alive / Launch on Boot in Website mode** (#37): Background apps (managed apps with "Keep Alive" or "Launch on Boot" enabled) can now be configured and monitored in Website (WebView) mode, not just App mode. A new "Background Apps" section appears in Settings → General when in Website mode. Use case: keep a music or audio receiver app (e.g. Spotify, Sendspin) alive in the background while displaying a web dashboard. The `BackgroundAppMonitorService` now runs independently of the display mode and stops itself automatically if no keep-alive apps are configured.
+
+- 🗣️ **Web Speech API (speechSynthesis) polyfill** (#NEW): Web apps running inside the WebView can now use the standard `window.speechSynthesis.speak()` API for text-to-speech. Android WebView does not natively implement the Web Speech API (unlike Chrome), so FreeKiosk injects a transparent polyfill that bridges `speechSynthesis.speak()` → `postMessage` → native Android `TextToSpeech` engine. This means any web app that uses TTS (e.g. accessibility tools, notification readers, custom kiosk UIs) will work out of the box without code changes. Supports `speak()`, `cancel()`, `getVoices()`, `onvoiceschanged`, `SpeechSynthesisUtterance` (text, lang, rate, pitch, volume), and automatic language detection via the existing FreeKiosk TTS engine. The polyfill only activates when the native `speechSynthesis` is missing or non-functional (no voices). Also exposed `HttpServerModule.speak()` and `HttpServerModule.stopSpeaking()` as React Native bridge methods for direct native TTS access from JS. Requested by Carlos via email
+
+- 🖨️ **Configurable print paper size** (#NEW): A new "Default Paper Size" selector appears in Settings → General → Printing when printing is enabled. Available sizes: A4, A5, A3, Letter, Legal. The selected size is used as the default in the Android print dialog — the user can still override it manually if needed. Previously the print dialog always defaulted to A4 regardless of CSS `@page` rules. Reported by Paolo Leone via email
+
+### Fixed
+- ⏳ **WebView stuck on infinite loading spinner for sites with redirect chains** (#140): On sites that respond with HTTP redirects (e.g. a homepage redirecting to a login page), `onLoadStart` fired once per redirect step and each call cleared and restarted the 10-second fallback timeout. If the site produced a rapid series of navigations (redirect chain, iframe loads, SPA internal routing), the countdown was continuously reset and never completed — leaving the loading overlay permanently on screen and hiding the actual page. Fixed by starting the fallback timer only once per loading session: if a timeout is already running, subsequent `onLoadStart` events leave it untouched. `onLoadEnd` and `onLoadProgress === 1` still cancel the timer normally when the page loads successfully. Reported by @SamuelSilvaG
+
+- 📶 **SSID showing "Wifi" instead of network name on Android 12+ devices** (#80): On Android 12+ (API 31+), `WifiManager.connectionInfo` is deprecated and returns `<unknown ssid>` even when the location permission is granted and location services are enabled. Fixed by using `NetworkCapabilities.transportInfo` (the recommended API since Android 10) to retrieve the `WifiInfo` object on API 31+. Affects the REST API `/api/info`, MQTT status messages, and all system info endpoints. Reported by @hapishyguy
+
+- 🔒 **Lock Mode permanently disabled after using "Exit Kiosk Mode"** (#124, #138): Calling "Exit Kiosk Mode" from the Advanced settings was writing `@kiosk_enabled=false` to AsyncStorage, which permanently disabled Lock Mode — on every subsequent launch, the kiosk started unlocked and users could escape via the home button. Root cause: the `setKioskEnabledInAsyncStorage(false)` call was added as belt-and-suspenders for the watchdog fix (#96), but the watchdog is already stopped explicitly via `stopService()` before the activity finishes, making the write unnecessary. Fixed by removing the AsyncStorage write from `exitKioskMode()` — `@kiosk_enabled` now stays `true`, so kiosk mode re-engages on the next FK launch. The DE fast-boot flag is still cleared (so `BootLockActivity` does not hard-lock on next reboot), and the watchdog is still stopped explicitly (#96 fix unaffected). Reported by @mpreusse and @Mkdir1511
+
+- 🗣️ **TTS silent for Chinese and other non-Latin languages even when language data is installed** (#115): Root cause was that `TextToSpeech()` was initialized without specifying an engine — Android may pick a default English-only engine rather than the engine the user configured in system settings (which has Chinese/Japanese/Korean support). Fixed by initializing TTS with `Settings.Secure.getString("tts_default_engine")` so FreeKiosk uses the same engine as the system TTS test page. Also improved `parseLocale()` to use `Locale.forLanguageTag()` (proper BCP 47 parsing) instead of manual string splitting, fixing edge cases with tags like `zh-CN` or `zh_CN`. Also applied the same engine fix and added language auto-detection to MQTT's `speakText()` which previously spoke all text without ever calling `setLanguage()`. Reported by @nowpast
+
+- 🔊 **Volume Button Alternative toggle not accessible in App mode** (#110): The "Volume Button Alternative" toggle (Settings → Security → Return to Settings) was hidden when display mode was set to App. It is now visible in all modes. The toggle description in App mode now clarifies that the feature is active by default and may cause accidental PIN triggers during normal volume adjustment — users who do not need it in App mode can disable it here. Reported by @Mkdir1511
+
+- 🔒 **Kiosk not locked during Android boot on low-end / slow devices** (#98): After reboot, there was a window of 15–60 seconds where the device was unprotected while React Native loaded. This was partially fixed in v1.2.17 by `BootLockActivity` (a pure-native activity that enters lock-task in under a second), but the fix was incomplete: `ACTION_LOCKED_BOOT_COMPLETED` fires before Android decrypts CE (user-encrypted) storage, so the SQLite/AsyncStorage reads used to check kiosk settings all returned their safe default (`false`), preventing `BootLockActivity` from launching at all. Fixed by using DE (Device Encrypted) `SharedPreferences` — readable at any point during the boot process — to persist whether the fast-boot lock should activate. The DE flag is written: (a) whenever `startLockTask` / `exitKioskMode` is called from the app, and (b) at every normal `ACTION_BOOT_COMPLETED` so it stays in sync. At `ACTION_LOCKED_BOOT_COMPLETED`, only the DE flag is read (no SQLite). Additionally, if `BootLockActivity` was launched at `LOCKED_BOOT_COMPLETED` but `MainActivity` (which is not Direct Boot–aware) couldn't start yet, the activity now retries launching `MainActivity` every 5 seconds in its poll loop until CE storage becomes available. Reported by @rarcher
+
+- 🔁 **Launch on Boot causes infinite loop in External App mode** (#37): Enabling "Launch on Boot" on a managed app (e.g. Velocity) while in External App mode caused the device to enter an unrecoverable loop — the screen cycled continuously between FreeKiosk and the external app until FreeKiosk was uninstalled. Three root causes fixed: (1) `launchBootApps()` was called on every `loadSettings()` invocation (including returns from Settings or PIN screen), not only on genuine app startup — a `bootAppsLaunchedRef` guard now ensures it fires at most once per app session; (2) `AppLauncherModule.launchBootApps()` called `bringFreeKioskToFront()` after launching the boot app, which triggered `MainActivity.onResume()` fast-path while `loadSettings` was still running — this caused a second native relaunch of the external app and a double-start of `OverlayService`, creating an unstable monitoring loop; (3) `OverlayService` is now started with the primary app's package **before** `launchBootApps()` is called (single-app mode only), so kiosk protection is active from the moment the boot app appears in the foreground — no unprotected window. As a bonus, `BootReceiver.launchMainActivityLegacy()` no longer calls `Thread.sleep()` on the main looper (replaced by a nested `postDelayed`), eliminating an ANR risk on Android 14+ devices. Reported by Tom Schiettecat (Hupac Intermodal)
+
+- 📄 **PDF Viewer fails to load PDFs from CDN/WAF-protected servers** (#BUG): PDFs hosted behind CDN/WAFs like Alibaba Cloud (e.g. byd.com) failed to load in the built-in PDF.js viewer with "Unable to load PDF" error. Three root causes fixed: (1) **Missing Referer header** — the native PDF proxy now injects `Referer: <pdf_url>` when the WebView doesn't send one (which is always the case from `file://` origins), preventing WAF anti-hotlink blocks; (2) **Lost session cookies** — `Set-Cookie` headers from proxied responses (e.g. Alibaba's `acw_tc` WAF cookie) are now persisted back into Android's `CookieManager` so subsequent requests include them; (3) **Range request failures** — PDF.js was making multiple range requests that lost WAF session state between requests, now uses `disableRange: true` for a single full-download request for maximum compatibility. Also improved viewer error messages to include the truncated URL for easier debugging. Reported by Martin Lemke via email
+- 📄 **PDF opened via popup (`window.open`) blocked by URL filtering**: When a website opened a PDF link via `window.open()` (popup), the `onOpenWindow` handler checked URL filtering **before** checking for PDF interception — causing the PDF to be blocked in whitelist mode even with the PDF viewer enabled. PDF detection now runs first in `onOpenWindow`, consistent with `onShouldStartLoadWithRequest`. Reported by Martin Lemke via email
+- 🎥 **Back button overlay disappears behind camera apps in fullscreen** (#121): In External App / Multi-App mode, FreeKiosk's return overlay (back button and 5-tap exit zone) disappeared when camera apps (Google Camera, Open Camera) entered their fullscreen viewfinder mode. Root cause: camera apps use a hardware-accelerated `SurfaceView` whose compositor layer can render above `TYPE_APPLICATION_OVERLAY` windows after certain window state transitions. Fix: `OverlayService` now runs a periodic re-pin loop (every 3 s) while an external app is locked — it removes and immediately re-adds the overlay to `WindowManager`, placing it back at the top of the overlay stack. Also added `FLAG_HARDWARE_ACCELERATED` to overlay window params for correct compositing. Note: camera apps that call `SurfaceView.setZOrderOnTop(true)` permanently may still briefly occlude the overlay between re-pin cycles; the volume-button 5-tap exit (Settings → Security) remains available as an always-reachable alternative. Reported by @jmynes
+
+- ⌨️ **Soft keyboard persists after screen sleep** (#135): When a kiosk page had an input focused (e.g. Force Numeric mode on a login screen) and the device timed out, the soft keyboard remained visible on the next screen-on instead of being dismissed with the sleep event. Fixed by calling `InputMethodManager.hideSoftInputFromWindow()` (+ `clearFocus()`) in `ScreenStateReceiver` when `ACTION_SCREEN_OFF` is received. Reported by @asfreitas17
+
+- 📱 **Display settings tab crashes on Android 8.x (StackOverflowError in Slider)** (#86): Opening Settings → Display on Android 8.x (API 26–27) triggered an immediate `StackOverflowError` and crashed the app. Root cause: on Android 8, `AppCompatSeekBar.setMax()` internally calls `setProgressInternal()` → `refreshProgress()` → `onProgressRefresh()` → `onProgressChanged()` on the registered listener. The listener then called `seekbar.setProgress()` to clamp the value, which re-triggered `onProgressChanged()` recursively until the stack overflowed. An earlier fix attempt (v1.2.16-beta.1) added a JS-side local state wrapper in `SettingsSlider` to reduce parent re-renders during drag, but the crash happened at **initialization** time (when React Native applies `minimumValue` / `maximumValue` props via the native bridge) so the JS fix had no effect. Root fix: added a `mIsSettingProgress` re-entrancy guard directly in `ReactSliderManager.onProgressChanged()` via a patch-package patch on `@react-native-community/slider@5.1.1` — the guard returns immediately if re-entered, breaking the recursive loop. Reported by @gauthier-th
+
+***
+
+## [1.2.18] - 2026-03-30
+
+### Added
+- 🖨️ **Allow Printing toggle** (#NEW): New "Allow Printing" setting (off by default) in General → Printing that enables `window.print()` support in kiosk mode. When enabled: (1) the `window.print()` JavaScript call is intercepted and routed to Android's native `PrintManager`, (2) print spooler packages (`com.android.printspooler` + all installed print services like Samsung Print, HP Print, etc.) are dynamically discovered via `queryIntentServices` and automatically whitelisted in Lock Task mode so the system print dialog can appear, (3) immersive mode is suspended while the print dialog is open and re-applied after it closes, (4) `onResume` lock task re-entry is deferred during printing to avoid killing the print UI, and (5) `data:` URLs are allowed in the WebView to support popup-based print flows (label printers, receipt generators). Supports WiFi, Bluetooth, USB printers and Save as PDF. Requested by @Poppy
+- ☀️ **Auto-Brightness Offset** (#92): New slider in Display → Auto-Brightness settings that lets you add a fixed percentage offset to the calculated auto-brightness value. For example, setting +10% means if the light sensor calculates 30% brightness, FreeKiosk will apply 40% instead. Useful when auto-brightness is consistently too dim for your environment but you still want it to adapt to ambient light. The offset is clamped at 100% maximum. Available in the settings UI (0–50% range with 5% steps) and via the REST API (`POST /api/autoBrightness/enable` now accepts an optional `offset` parameter, 0–100). Requested by @Delivator
+
+### Fixed
+- **TTS silent for non-English text** (#115): `/api/tts` only spoke English and was completely silent for Chinese, Japanese, Korean and other non-Latin text because `TextToSpeech.setLanguage()` was never called — the engine defaulted to English. Added automatic language detection based on Unicode script analysis (CJK → Chinese, Hangul → Korean, Hiragana/Katakana → Japanese, Arabic, Thai, Hindi, Cyrillic, etc.). Also added an optional `language` parameter (BCP 47 tag, e.g. `"zh-CN"`, `"ja"`, `"ko"`) for explicit control. The locale is now set before each `speak()` call. Requires the target language TTS voice data to be installed on the device. Reported by @nowpast
+- **Some packages do not show up in app picker** (#112): Packages without a launchable UI (services, VPN tools like gnirehtet, etc.) were excluded from the managed apps picker because `getInstalledApps()` filtered on `getLaunchIntentForPackage() != null`. Added a new native method `getAllInstalledApps()` that includes user-installed (non-system) packages even when they have no launcher activity. The managed apps picker now uses this method and offers a **"Show all packages"** toggle (off by default) to reveal background services/VPNs. Non-UI apps display a "service" badge for clarity. The single-app primary picker remains launcher-only since launching a non-UI package as the main app is not meaningful. Reported by @Royalflamejlh
+- **ADB configuration doesn't support multi-app mode** (#111): Added `external_app_mode` and `managed_apps` ADB intent extras to configure multi-app mode via ADB. You can now set `--es external_app_mode "multi"` and provide a JSON array of apps with `--es managed_apps '[{"packageName":"com.app1"},{"packageName":"com.app2"}]'`. Each app supports `showOnHomeScreen`, `launchOnBoot`, `keepAlive`, and `allowAccessibility` flags. Both individual intent extras and full JSON config (`--es config '{...}'`) are supported. Uninstalled packages are silently skipped. Display names are auto-resolved from the system if not provided. Reported by @Royalflamejlh
+- **Volume buttons trigger PIN request when held** (#110): Holding the volume button to adjust volume would trigger the PIN request because both `MainActivity.onKeyDown` and `VolumeChangeReceiver` counted auto-repeat/rapid events as separate taps. Fixed by ignoring `KeyEvent` with `repeatCount > 0` in `MainActivity`, and adding a minimum 250ms interval between counted volume changes in `VolumeChangeReceiver` to filter out the rapid events (~50-100ms) generated by holding the button. Deliberate separate presses (≥250ms apart) still work normally. Reported by @Mkdir1511
+- **Crash on boot with Lock Mode enabled** (#109): `BootLockActivity` crashed immediately on boot with a `NullPointerException` in `hideSystemUI()` because `window.insetsController` was called before `setContentView()`. On Android R+ (API 30+), this internally accesses the `DecorView` which is only created by `setContentView()` — so the DecorView was `null`. Fixed by reordering the calls so `setContentView()` runs first, and added a try-catch safety net in `hideSystemUI()` for extra robustness on devices with unusual boot timing. Only affected v1.2.17-beta.1; v1.2.16 was unaffected because it didn't have `BootLockActivity`. Reported by @sharkooon
+- **Backup import from other devices / ADB push not working** (#107): On Android 11+ (Scoped Storage), backup files pushed via `adb push` or copied from another device were invisible to the import list because `RNFS.readDir()` can only see files created by the app itself. Added a **"Browse device for backup file..."** button in the import modal that uses Android's Storage Access Framework (SAF) via `ACTION_OPEN_DOCUMENT` to open the native file picker — this bypasses Scoped Storage restrictions entirely. The JSON content is read directly through `ContentResolver` (no file copy needed). Also added `importBackupFromContent()` and `parseBackupContent()` to `BackupService` for content-based import/preview, and improved the empty-state message to guide users toward the browse button. Reported by @sharkooon
+- 📖 **Device Owner setup incorrectly requires factory reset** (#68): Updated all setup documentation (README, INSTALL.md, ADB_CONFIG.md, FAQ) to clarify that a factory reset is **not** required to activate Device Owner. Android's actual requirement is that no user accounts are active on the device — users can simply sign out of all accounts, run the `dpm` command, and sign back in. Factory reset is now documented as a fallback only. Also added notes about SIM profiles/accounts that some devices retain. Reported by @realAllonZ, confirmed by @hapishyguy
+- **WebView blocked by hosting providers (SiteGround, etc.)**: The hardcoded User-Agent (`Chrome/120.0.0.0` on `X11; Linux x86_64`) was outdated and had a platform mismatch — hosting WAFs flagged it as a bot. Updated the default UA to a modern Chrome 131 on Android (`Mozilla/5.0 (Linux; Android 13; Pixel 6) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Mobile Safari/537.36`). Also added a new **Custom User Agent** setting in Display settings, allowing users to override the UA string if specific sites require it
+- **Screen Sleep Schedule not saving in App mode** (#103): The Screen Sleep Scheduler settings (enabled, rules, wake-on-touch) were only persisted when in Website or Media Player mode. In External App mode, the save function forcibly reset `screenSchedulerEnabled` to `false` and discarded all rules — even though the UI allowed configuring them in all modes. Moved scheduler save calls out of the mode-conditional block so they are now saved unconditionally, consistent with how they are loaded and executed. Reported by @hungrycactus
+- **MQTT audio commands not working** (#102): `audio_play`, `audio_beep`, and `audio_stop` MQTT commands were not functional while their REST API equivalents worked fine. The MQTT path forwarded audio commands to JS (`ApiService.ts`) which had no handler for them, whereas the REST API handled them natively in Kotlin (`HttpServerModule`). Added native audio handling (`MediaPlayer`, `AudioTrack`) directly in `MqttModule.kt`, matching the existing REST API implementation. Reported by @zeroping
+- **MQTT still fails on older devices after #97 fix** (#97): On older devices (Android 11 and below), R8 obfuscation of HiveMQ's internal classes (Dagger 2 IoC components, staged auth builder interfaces, lazy `InstanceHolder` factories) caused `AbstractMethodError` or `IncompatibleClassChangeError` on older ART runtimes when the auth code path was taken. Added comprehensive ProGuard keep rules for HiveMQ, Dagger, javax.inject, and RxJava. Hardened error handling with `catch (Throwable)` (instead of `catch (Exception)`) to properly catch `Error` subclasses from Netty/Dagger static initialization and propagate them to the UI
+- **Kiosk Watchdog not stopping on exit** (#96): Fixed KioskWatchdogService continuing to run (and relaunching the app) after intentionally exiting kiosk mode. The watchdog now writes `@kiosk_enabled=false` to AsyncStorage and explicitly stops the service before closing the activity. Also clears the watchdog notification on exit. Reported by @krheinwald
+
+***
+
+## [1.2.17] - 2026-03-11
+
+### Added
+- 🔒 **Boot Lock Activity** (#98): New lightweight native Android activity (`BootLockActivity`) that enters lock-task mode immediately after boot — before React Native loads. On low-spec devices (e.g. Nokia C210) where RN can take 1-2 minutes to initialize, this eliminates the window where users could interact with the OS freely. The activity shows a minimal loading screen (app icon + spinner) and automatically hands off to MainActivity once React Native is ready. Only activates for Device Owner installs with kiosk mode enabled; non-DO installs use the existing delayed-launch path
+- 🛡️ **Kiosk Watchdog Service** (#96): New `KioskWatchdogService` foreground service using `START_STICKY` flag to survive OOM kills. On low-RAM devices (e.g. 2GB AndroidTV), if the browser consumes too much memory and the kernel kills FreeKiosk, the watchdog automatically relaunches it within seconds. Includes relaunch cooldown (15s) to prevent relaunch storms, self-disables when kiosk mode is turned off, and uses a silent minimal-priority notification
+- 🎬 **Media Player Mode** (#NEW): Brand-new display mode alongside Website and External App. Play videos and images in full-screen kiosk mode with playlist support. Features include:
+  - **Local file support**: Pick videos and images directly from the device via Android's native file picker. Files are copied to app internal storage for reliable WebView playback. Supports single and multi-file selection with filter by type (video/image/any). Local files show a 📱 badge and filename in the playlist
+  - **Native FilePickerModule**: New Kotlin native module (`FilePickerModule.kt`) using `ACTION_OPEN_DOCUMENT` intent with `ActivityEventListener` for result handling. Copies selected `content://` URIs to `files/media_player/` with unique naming. Includes `deleteMediaFile`, `listMediaFiles`, `clearMediaFiles` helpers
+  - **Remote URL support**: Also accepts remote `http://` and `https://` URLs for hosted media content
+  - **Playlist management**: Add multiple media URLs or pick local files from General settings, with auto-detection of media type based on file extension or MIME type
+  - **Video support**: MP4, WebM, OGG formats with optional mute toggle
+  - **Image support**: PNG, JPG, GIF, SVG, WebP with configurable per-item or default display duration (seconds)
+  - **Playback options**: Auto-play, loop, shuffle, and optional on-screen controls (prev/play-pause/next with progress bar)
+  - **Display options**: Fit mode (contain/cover/fill), background color, crossfade transitions with configurable duration
+  - **Full kiosk integration**: Brightness control, screensaver, screen always on, status bar, lock mode, volume button return, and touch blocking all work identically to Website mode
+  - **WebView-based rendering**: Uses an embedded HTML5 player via react-native-webview with `allowFileAccess`, `allowFileAccessFromFileURLs`, and `allowUniversalAccessFromFileURLs` enabled for local file playback. Dual-slot crossfade transitions
+  - **Error handling**: Auto-skips unplayable items with retry, shows friendly empty state when no items configured
+  - **Settings persistence**: All media player settings saved to AsyncStorage (including `isLocal` and `fileName` fields), included in backup/restore, and properly reset
+  - **Android 13+ permissions**: Added `READ_MEDIA_VIDEO` and `READ_MEDIA_IMAGES` permissions for granular media access on Android 13+
+- 📊 **Dashboard Mode**: New display mode that shows a configurable grid of URL tiles instead of a single WebView. Users can create tiles with custom names and URLs, each automatically assigned a distinct color. Tapping a tile opens its URL in the WebView with a navigation bar (back/forward/refresh/home). Configurable in Settings → Dashboard tab
+- 📱 **Multi-App Mode** (#67): External App mode now supports managing multiple apps. Add apps from the new "Managed Apps" section in General settings — each app appears on a home screen grid with icon circles. All managed apps are automatically whitelisted in Lock Task Mode, so users can switch between them without escaping the kiosk. The primary app (single package) still works exactly as before for backward compatibility
+- 🚀 **Launch App on Boot** (#37): Managed apps with "Launch on Boot" enabled are automatically started in the background when the device boots, before FreeKiosk's own UI loads. Combined with "Keep Alive", apps can be maintained as persistent background services
+- 💓 **Keep Alive Background Monitor** (#37): New `BackgroundAppMonitorService` foreground service checks every 30 seconds (via `UsageStatsManager`) if managed apps with "Keep Alive" enabled are still running, and relaunches them if they've stopped or crashed. Starts automatically on boot when at least one keep-alive app is configured
+- ♿ **Accessibility Whitelist for Other Apps** (#66): Device Owners can now allow other apps' accessibility services via a per-app "Allow Accessibility" toggle in Managed Apps settings. Uses `DevicePolicyManager.setPermittedAccessibilityServices()` to whitelist selected packages alongside FreeKiosk's own service. Applied at boot, on save, and when enabling via Device Owner
+- ⚙️ **Android Settings Button** (#89): New "Android System Settings" section in the Advanced tab with a main button to open the native Android settings, plus quick-access shortcuts for WiFi, Sound, Display, Bluetooth, Date & Time, and Apps. Fully compatible with Lock Task Mode (kiosk): automatically pauses the lock, opens the settings, and re-engages kiosk mode when the user returns to FreeKiosk. An info banner warns when kiosk mode is active. Useful for devices with no physical navigation buttons where ADB commands are restricted by Admin mode
+- 🔍 **WebView Zoom Level** (Display settings): New slider to control how web pages are rendered in WebView mode. Range: 50%–200%, default 100% (matches Chrome's default rendering). Quick presets at 75%, 100%, 125%, 150%. An info hint appears when zoom is not at default. Persisted to storage and included in backup/restore. Only available in WebView mode
+
+### Changed
+- 🏪 **Play Store compliance: conditional self-update** (#playstore): In-app self-update via GitHub (check for updates, download APK, install) is now completely disabled when building for the Play Store. A single Gradle flag (`-Pplaystore`) controls everything at compile time — no separate codebase needed. When active: `REQUEST_INSTALL_PACKAGES` permission is removed from the merged manifest, `UpdateInstallReceiver` is disabled, the entire "Updates" UI section is hidden from Settings → Advanced, and all native update methods become no-ops. R8 strips the dead update code from the final bytecode. Normal sideload/F-Droid builds (`./gradlew assembleRelease`) remain fully functional with self-update enabled. Play Store builds: `./gradlew bundleRelease -Pplaystore`
+
+### Fixed
+- 🔊 **Volume buttons trigger PIN request when held** (#110): Holding the volume button to adjust volume would trigger the PIN request because both `MainActivity.onKeyDown` and `VolumeChangeReceiver` counted auto-repeat/rapid events as separate taps. Fixed by ignoring `KeyEvent` with `repeatCount > 0` in `MainActivity`, and adding a minimum 250ms interval between counted volume changes in `VolumeChangeReceiver` to filter out the rapid events (~50-100ms) generated by holding the button. Deliberate separate presses (>=250ms apart) still work normally. Reported by @Mkdir1511
+- 🔊 **Volume buttons trigger PIN request when held** (#110): Holding the volume button to adjust volume would trigger the PIN request because both `MainActivity.onKeyDown` and `VolumeChangeReceiver` counted auto-repeat/rapid events as separate taps. Fixed by ignoring `KeyEvent` with `repeatCount > 0` in `MainActivity`, and adding a minimum 250ms interval between counted volume changes in `VolumeChangeReceiver` to filter out the rapid events (~50-100ms) generated by holding the button. Deliberate separate presses (≥250ms apart) still work normally. Reported by @Mkdir1511
+- 📡 **MQTT doesn't connect when password is set** (#97): Fixed a crash in the password masking logic used for debug logging — `String.repeat(password.length - 6)` produced a negative count for passwords shorter than 7 characters, throwing `IllegalArgumentException` before the MQTT client was even built. This silently aborted `connect()`, resulting in zero network traffic and an immediate return to "Disconnected". Also fixed authentication being skipped entirely when a password was configured without a username (the auth block was gated on `!username.isNullOrBlank()` only)
+- 🔄 **Inactivity Return now works in Dashboard Mode**: Previously, enabling "Inactivity Return" with Dashboard Mode had no effect because the feature required a base URL (which is empty in dashboard mode). Now correctly returns to the dashboard grid after the configured timeout
+- 🔄 **URL Planner return to dashboard grid**: When a scheduled planner event ended while in Dashboard Mode, the app did not return to the dashboard grid due to a stale closure in the planner callback. Fixed by using a ref to track the active event
+- ♿ **Accessibility auto-enable fails with "Permission denial: WRITE_SECURE_SETTINGS"** (#99): The "Enable Automatically (Device Owner)" button crashed because `Settings.Secure.putString()` requires `android.permission.WRITE_SECURE_SETTINGS`, which is not automatically granted to Device Owners. Added the permission to the manifest, wrapped the secure settings write in a `SecurityException` catch with a specific `WRITE_SECURE_SETTINGS_REQUIRED` error code, and improved the UI to show a clear dialog with the one-time ADB command (`adb shell pm grant com.freekiosk android.permission.WRITE_SECURE_SETTINGS`). The "Open Accessibility Settings" manual fallback remains available. `BootReceiver` also handles the missing permission gracefully instead of crashing silently. Updated ADB provisioning scripts and troubleshooting docs
+- 🔒 **PIN bypass via back gesture** (#93): Fixed a security issue where swiping back (Android predictive back gesture) from the Settings or PIN screen could bypass PIN protection on Android 16+ devices (e.g. Lenovo Idea Tab Pro). Disabled swipe-back gestures on PIN and Settings screens, added `BackHandler` to block hardware/gesture back navigation, and replaced `navigation.navigate` with `navigation.reset` to fully clear the navigation stack when returning to kiosk mode
+- 📦 **Self-update fails with "No storage permission"** (#88): The APK download used `setDestinationInExternalPublicDir()` which requires `WRITE_EXTERNAL_STORAGE` runtime permission — never requested at runtime. Switched to `setDestinationInExternalFilesDir()` (app-private directory), eliminating the storage permission requirement entirely. Old downloaded APKs are now cleaned up automatically before each new download
+- 📦 **Self-update fails to install on Android 8+** (#88): After downloading, the APK install was blocked because "Install from unknown sources" was not enabled for the app. Added a pre-download permission check (`canRequestPackageInstalls()`) with a user-friendly dialog that opens the system settings page to grant the permission. On restricted devices (e.g. Amazon Echo Show / Fire OS) where the settings page doesn't exist, a clear fallback message guides the user to use `adb install -r <apk>` instead
+- 🔧 **Duplicate import in HttpServerModule** (#88): Removed duplicate `android.location.LocationManager` import that caused Kotlin compilation failure
+- 🎮 **Remote control now works natively like a physical keyboard** (#85): Remote key commands (`/api/remote/up`, `down`, `left`, `right`, `select`, `back`, `home`, `menu`, `playpause`) were previously routed through a JavaScript round-trip via React Native bridge, which prevented them from behaving like real hardware key presses. Now handled entirely in native code — dispatched via the AccessibilityService (cross-app D-pad navigation with UI element highlighting) or `activity.dispatchKeyEvent()` (in-app fallback). On /e/OS, LineageOS, and other custom ROMs, this enables proper focus-based UI navigation identical to a physical remote/keyboard
+- 📡 **MQTT now supports remote control and keyboard commands** (#85): Added 12 new MQTT command topics for full remote control parity with the REST API — `remote_up`, `remote_down`, `remote_left`, `remote_right`, `remote_select`, `remote_back`, `remote_home`, `remote_menu`, `remote_playpause`, `keyboard_key`, `keyboard_combo`, `keyboard_text`. Home Assistant Discovery registers 9 new button entities (remote D-pad) and 3 new text entities (keyboard input), bringing the total from 30 to 42 auto-discovered entities
+- 📡 **MQTT background persistence** (#80): MQTT now stays alive when the app is in background or the screen is off, with 4 layers of protection: (1) `PARTIAL_WAKE_LOCK` + `WIFI_MODE_FULL_HIGH_PERF` keep CPU and WiFi active for MQTT PING packets, (2) `NetworkCallback` detects WiFi recovery and triggers immediate reconnect instead of waiting for TCP timeout + exponential backoff, (3) OverlayService watchdog checks MQTT health every 60 seconds from the existing foreground service, (4) `SCREEN_ON` receiver triggers an instant MQTT reconnect check when the screen wakes up
+- 🏷️ **MQTT Device Name prompt on every keystroke** (#80): Changing the Device Name no longer triggers a reconnect popup on every key press. The reconnect prompt now only appears once when the field loses focus (onBlur), so you can finish typing the full name before being asked to reconnect
+- 📶 **WiFi `connected` field reporting true when not on WiFi** (#80): MQTT status and REST API used `ipAddress != "0.0.0.0"` to determine WiFi connection, which returned `true` if the device had cellular data, Ethernet, or USB tethering. Now uses `ConnectivityManager.getNetworkCapabilities(TRANSPORT_WIFI)` consistently across all 3 modules (SystemInfoModule, MqttModule, HttpServerModule) — only returns `true` when actually connected to WiFi
+- 📶 **SSID shows "WiFi" instead of actual network name** (#80): When Android blocks SSID access (missing location permission or location services disabled), the app now shows a diagnostic message — `"WiFi (no permission)"` or `"WiFi (location off)"` — instead of silently showing `"WiFi"`, so users can identify and fix the issue. Also handles the `0x` edge case on some Chinese tablets
+
+
+***
+
+## [1.2.16] - 2026-03-03
+
+### Added
+- 💤 **"Keep Screen On" toggle** (#83): New option in Display settings to disable `FLAG_KEEP_SCREEN_ON`. When turned off, the Android system manages screen timeout normally — the display turns off after the device's configured inactivity period, just like a regular device. Default is ON (standard kiosk behavior — no change for existing users). Screensaver is automatically disabled and hidden when this option is off, since the system handles sleep. Only available in WebView mode (External App mode already delegates screen management to the system). Included in backup/restore and reset. REST API / MQTT `screensaverOn` command is ignored when keep-screen-on is disabled
+- 📊 **Device hardware info in MQTT & REST API** (#80): Status now includes `manufacturer`, `model`, `androidVersion`, `apiLevel`, `processor`, `deviceName`, `product`, and `uptime` fields in both MQTT status and REST API `/api/status`. Home Assistant Discovery now registers 5 new sensors: Manufacturer, Model, Android Version, Processor, and Uptime
+- 📊 **Real device info in Home Assistant Discovery**: Device block now shows actual manufacturer and model (e.g., "Samsung Galaxy Tab A") instead of hardcoded "FreeKiosk by FreeKiosk". Added `hw_version` with Android version info
+
+### Fixed
+- 🔊 **Volume buttons trigger PIN request when held** (#110): Holding the volume button to adjust volume would trigger the PIN request because both `MainActivity.onKeyDown` and `VolumeChangeReceiver` counted auto-repeat/rapid events as separate taps. Fixed by ignoring `KeyEvent` with `repeatCount > 0` in `MainActivity`, and adding a minimum 250ms interval between counted volume changes in `VolumeChangeReceiver` to filter out the rapid events (~50-100ms) generated by holding the button. Deliberate separate presses (>=250ms apart) still work normally. Reported by @Mkdir1511
+- 🔊 **Volume buttons trigger PIN request when held** (#110): Holding the volume button to adjust volume would trigger the PIN request because both `MainActivity.onKeyDown` and `VolumeChangeReceiver` counted auto-repeat/rapid events as separate taps. Fixed by ignoring `KeyEvent` with `repeatCount > 0` in `MainActivity`, and adding a minimum 250ms interval between counted volume changes in `VolumeChangeReceiver` to filter out the rapid events (~50-100ms) generated by holding the button. Deliberate separate presses (≥250ms apart) still work normally. Reported by @Mkdir1511
+- **Accessibility service persistence** (#80): Added `android:isAccessibilityTool="true"` to prevent Android 12+ from auto-disabling the service after inactivity. Added automatic re-enablement on boot when app is Device Owner — the accessibility service is now programmatically re-enabled in `BootReceiver` using Device Owner privileges, surviving reboots without manual intervention
+- 📡 **MQTT disconnects when app goes to background** (#80): Added `AppState` listener that detects when the app returns to foreground and automatically reconnects MQTT if the connection was lost during background/Doze mode. Devices now recover their MQTT connection seamlessly
+- 🏷️ **MQTT Device Name not updating** (#80): Changing the Device Name in MQTT settings now prompts the user to reconnect, ensuring the new name takes effect in topics and Home Assistant discovery. Previously the old name/ID persisted until a manual disconnect/connect cycle
+- 🏷️ **MQTT Device Name pre-filled with device model** (#80): The Device Name field now auto-fills with the Android device model (e.g., "SM-T510", "Pixel 7") on first use, instead of generating a random hex ID. Makes it easy to identify devices in a fleet
+- 🧪 **ExecuteJS command reliability** (#80): Fixed `executeJs` (via REST API and MQTT) silently failing when: (a) the same JS code was sent twice in a row (React state didn't change), (b) the page was still loading. Now appends a unique marker to force re-execution, and retries up to 5 seconds if the page is loading
+- 📶 **SSID reporting inconsistency** (#80): Fixed `<unknown ssid>` being passed through raw in `SystemInfoModule` (Status Bar) — now consistently shows "WiFi" as fallback across all modules when location permission prevents SSID access
+- �📷 **Camera2 fallback for devices where CameraX fails entirely** (MediaTek LEGACY, front-only cameras): On some devices, CameraX's `CameraValidator` permanently rejects the camera (e.g. front-only devices where BACK camera verification fails), so vision-camera never reports any cameras. Added a Camera2 API fallback: the settings screen now queries `Camera2` directly via a new `getCamera2Devices()` native method when CameraX returns nothing, and the motion detector automatically switches to Camera2-based photo capture (`captureCamera2Photo()`) when vision-camera has no device — enabling motion detection on hardware that CameraX cannot handle
+- 🐛 **Fixed crash (CalledFromWrongThreadException) when entering standby/screensaver** (#82): Native events (`onScheduledSleep`, `onScheduledWake`, `navigateToPin`, `onScreenStateChanged`, API commands) were triggering React state updates synchronously on the `mqt_v_native` thread, causing `react-native-screens` to manipulate the Android view hierarchy from a non-UI thread. Wrapped all native event callbacks with `setTimeout(cb, 0)` to defer state updates to the next event loop tick, ensuring React commits go through proper UI thread dispatch
+- 🐛 **Fixed invisible PIN input on dark mode devices** (#81): The PIN `TextInput` had no explicit `color` set, so Android dark mode overrode the text/dot color to white — making input invisible against the white background. Added explicit `color: '#333333'` and `placeholderTextColor` to ensure dots and placeholder are always visible regardless of system theme
+
+***
+
+## [1.2.15] - 2026-02-26
+
+### Added
+- 💡 **Allow system brightness management** (#65): New toggle "App Brightness Control" in Display settings. When disabled, FreeKiosk never touches screen brightness — system tools like Tasker, Android adaptive brightness, or other automation apps retain full control. Applies to both WebView and External App modes. All brightness-related UI (manual slider, auto-brightness, screensaver brightness) is hidden when disabled. REST API brightness commands are also ignored when disabled.
+- 🧪 **Beta update channel**: Opt-in toggle to receive pre-release versions before stable releases
+  - New "🧪 Beta Updates" toggle in the Updates section (Settings → Advanced)
+  - When enabled, the in-app updater checks GitHub pre-releases (tagged `v1.2.15-beta.1`, etc.)
+  - When disabled (default), behavior is unchanged — only stable releases are shown
+  - Update alert shows a 🧪 badge and "(pre-release)" label for beta versions
+  - Semver-aware version comparison: `1.2.15-beta.1 < 1.2.15-beta.2 < 1.2.15` (stable always wins)
+  - No downgrade: switching beta OFF won't propose installing an older stable over a newer beta
+
+### Fixed
+- 🔊 **Volume buttons trigger PIN request when held** (#110): Holding the volume button to adjust volume would trigger the PIN request because both `MainActivity.onKeyDown` and `VolumeChangeReceiver` counted auto-repeat/rapid events as separate taps. Fixed by ignoring `KeyEvent` with `repeatCount > 0` in `MainActivity`, and adding a minimum 250ms interval between counted volume changes in `VolumeChangeReceiver` to filter out the rapid events (~50-100ms) generated by holding the button. Deliberate separate presses (>=250ms apart) still work normally. Reported by @Mkdir1511
+- 🔊 **Volume buttons trigger PIN request when held** (#110): Holding the volume button to adjust volume would trigger the PIN request because both `MainActivity.onKeyDown` and `VolumeChangeReceiver` counted auto-repeat/rapid events as separate taps. Fixed by ignoring `KeyEvent` with `repeatCount > 0` in `MainActivity`, and adding a minimum 250ms interval between counted volume changes in `VolumeChangeReceiver` to filter out the rapid events (~50-100ms) generated by holding the button. Deliberate separate presses (≥250ms apart) still work normally. Reported by @Mkdir1511
+- 🔐 **MQTT password field adding extra characters**: Removed custom bullet-masking logic in `SettingsInput` and replaced with native `secureTextEntry` — same fix as PinInput (v1.2.5). Custom masking reconstructed the real value from display text lengths, which broke with Samsung/Gboard predictive text, autocorrect, and paste, silently injecting extra characters. Affects MQTT password, API key, and all other password fields using `SettingsInput`.
+- **REST API camera photo endpoint returns "Invalid or missing API key" after settings change**: `ApiSettingsSection` now always restarts the HTTP server with the current stored settings when the REST API settings page is opened. Previously, if the server was started by `KioskScreen` with an API key that was later cleared in settings, the running server kept its stale config (the JS settings page found it "already running" and skipped re-applying the new config). Also fixed a related race condition in the port/key/control change handlers where they checked a potentially-stale React `serverRunning` state instead of querying the native module.
+- 🔧 **Motion detection shows "No cameras available" on non-standard SoCs** (Rockchip, Amlogic, etc.): react-native-vision-camera's ProcessCameraProvider initializes asynchronously — on slow hardware it resolves after the settings screen already read the empty camera list; fixed by subscribing to `CameraDevicesChanged` so the UI updates as soon as cameras become available
+
+***
+
+## [1.2.14] - 2026-02-23
+
+### Added
+- 🔌 **MQTT Configuration via ADB intents**: Configure all MQTT settings headlessly for automated tablet provisioning
+  - 11 parameters supported: `mqtt_enabled`, `mqtt_broker_url`, `mqtt_port`, `mqtt_username`, `mqtt_password`, `mqtt_client_id`, `mqtt_base_topic`, `mqtt_discovery_prefix`, `mqtt_status_interval`, `mqtt_allow_control`, `mqtt_device_name`
+  - MQTT password stored securely in Android Keychain, same pattern as PIN
+  - Example usage:
+    ```bash
+    adb shell am start -n com.freekiosk/.MainActivity \
+        --es mqtt_enabled "true" \
+        --es mqtt_broker_url "broker.local" \
+        --es mqtt_port "1883" \
+        --es mqtt_username "user" \
+        --es mqtt_password "pass"
+    ```
+- 🔒 **TLS/SSL MQTT support**: New `useTls` config option — auto-enabled when port is 8883
+- 🔔 **MQTT connection errors surfaced to UI**: Broker errors (e.g. `NOT_AUTHORIZED`) now propagate from native Kotlin → JS → Settings UI — no more silent failures
+- 💾 **Password saved hint**: Shows "Password is saved" when a password is already configured, preventing accidental overwrites
+
+### Fixed
+- 🔊 **Volume buttons trigger PIN request when held** (#110): Holding the volume button to adjust volume would trigger the PIN request because both `MainActivity.onKeyDown` and `VolumeChangeReceiver` counted auto-repeat/rapid events as separate taps. Fixed by ignoring `KeyEvent` with `repeatCount > 0` in `MainActivity`, and adding a minimum 250ms interval between counted volume changes in `VolumeChangeReceiver` to filter out the rapid events (~50-100ms) generated by holding the button. Deliberate separate presses (>=250ms apart) still work normally. Reported by @Mkdir1511
+- 🔊 **Volume buttons trigger PIN request when held** (#110): Holding the volume button to adjust volume would trigger the PIN request because both `MainActivity.onKeyDown` and `VolumeChangeReceiver` counted auto-repeat/rapid events as separate taps. Fixed by ignoring `KeyEvent` with `repeatCount > 0` in `MainActivity`, and adding a minimum 250ms interval between counted volume changes in `VolumeChangeReceiver` to filter out the rapid events (~50-100ms) generated by holding the button. Deliberate separate presses (≥250ms apart) still work normally. Reported by @Mkdir1511
+- 🔄 **MQTT reconnect losing credentials**: HiveMQ's `automaticReconnect()` was sending `null` username/password on reconnection, causing the broker to reject with `NOT_AUTHORIZED`. Replaced with manual reconnect that always sends full credentials, with exponential backoff (1s → 30s)
+- 🏗️ **Release build crash (R8/ProGuard)**: R8 obfuscation was renaming Netty/JCTools fields used via `Unsafe.objectFieldOffset()` reflection, causing `ExceptionInInitializerError` on startup in release builds. Added official HiveMQ ProGuard rules (`-keepclassmembernames`)
+- 📋 **Password paste truncated to one character**: MQTT password field was incorrectly capturing only the last character on paste (`slice(-1)` → `slice(-charsAdded)`)
+- ⌨️ **Broker URL keyboard adding spaces after dots**: Fixed by setting `keyboardType="url"` on the broker URL input
+- 🔁 **Connect button ALREADY_RUNNING error**: `handleConnect` now stops the existing MQTT client before starting a new one
+- 🔄 **External App Mode: child activities no longer killed by auto-relaunch** (#69): barcode scanners, file pickers, camera intents, and other child activities launched by the locked app are now properly detected and allowed
+  - Uses `ActivityManager.runningAppProcesses` to check if the locked app's process is still alive (not crashed) — if alive and foreground is not a launcher, it's a child activity
+  - Launchers (Home screen) are dynamically detected via `PackageManager.queryIntentActivities(ACTION_MAIN, CATEGORY_HOME)` — works on all OEMs without hardcoding
+  - Safe in Lock Task mode: user cannot open other apps, only the locked app can launch child activities
+  - Logic: launcher detected → relaunch FreeKiosk; locked app process alive → allow child activity; process dead → relaunch FreeKiosk
+  - Fixes use cases: MLKit barcode scanner, camera intents, file pickers, permission dialogs, any native modal launched by the locked app
+- 🚀 **External App Mode boot: REST API now starts automatically**: When FreeKiosk is set as default launcher in External App Mode, `HomeActivity` now also starts `MainActivity` in background
+  - Ensures REST API server, MQTT, and other services are running even when an external app is in foreground
+  - `MainActivity` automatically moves to background (`moveTaskToBack`) when started from `HomeActivity`
+  - Fixes issue where the external app would start but FreeKiosk's API server wouldn't be accessible
+
+***
+
+## [1.2.13] - 2026-02-20
+
+### Added
+- 📡 **MQTT + Home Assistant Auto-Discovery**: Native MQTT client with full HA integration
+  - **27 auto-discovered entities** in Home Assistant via MQTT Discovery protocol
+  - **11 sensors**: Battery level, brightness, WiFi SSID, WiFi signal, light sensor, IP address, app version, memory used, storage free, current URL, volume
+  - **6 binary sensors**: Screen on/off, screensaver active, battery charging, kiosk mode, device owner, motion detected
+  - **2 number controls**: Brightness (0-100%), volume (0-100%) — adjustable sliders in HA
+  - **2 switches**: Screen power (ON/OFF), screensaver (ON/OFF)
+  - **5 buttons**: Reload, wake, reboot, clear cache, lock
+  - **1 text entity**: Navigate URL — send a URL to load in the WebView
+  - **20 additional commands** via MQTT: TTS, toast, audio play/stop/beep, launch app, execute JS, URL rotation start/stop, restart UI
+  - **Push-based status**: Periodic state publishing (configurable 5-3600 seconds, default 30s)
+  - **LWT (Last Will & Testament)**: Automatic availability tracking — HA shows device as unavailable on disconnect
+  - **Auto-reconnect**: Handles WiFi drops and broker restarts with automatic re-publishing of all discovery configs
+  - **Always-on Motion Detection**: Configurable option to run camera-based motion detection continuously (not just during screensaver)
+  - **Full command parity** with REST API — both interfaces dispatch through the same command handler
+  - **Concurrent operation**: MQTT and REST API can run simultaneously
+  - Eclipse Paho MQTT v3.1.1 with secure password storage (Android Keychain)
+  - Settings: Broker URL, port, username, password, client ID, base topic, discovery prefix, status interval, allow control
+  - Connection status indicator in Settings UI
+  - MQTT settings included in backup/restore
+  - **[Full MQTT Documentation](docs/mqtt.md)**
+### Fixed
+- 🔊 **Volume buttons trigger PIN request when held** (#110): Holding the volume button to adjust volume would trigger the PIN request because both `MainActivity.onKeyDown` and `VolumeChangeReceiver` counted auto-repeat/rapid events as separate taps. Fixed by ignoring `KeyEvent` with `repeatCount > 0` in `MainActivity`, and adding a minimum 250ms interval between counted volume changes in `VolumeChangeReceiver` to filter out the rapid events (~50-100ms) generated by holding the button. Deliberate separate presses (>=250ms apart) still work normally. Reported by @Mkdir1511
+- 🔊 **Volume buttons trigger PIN request when held** (#110): Holding the volume button to adjust volume would trigger the PIN request because both `MainActivity.onKeyDown` and `VolumeChangeReceiver` counted auto-repeat/rapid events as separate taps. Fixed by ignoring `KeyEvent` with `repeatCount > 0` in `MainActivity`, and adding a minimum 250ms interval between counted volume changes in `VolumeChangeReceiver` to filter out the rapid events (~50-100ms) generated by holding the button. Deliberate separate presses (≥250ms apart) still work normally. Reported by @Mkdir1511
+- 🔊 **No audio in Lock Mode on Samsung/OneUI devices**: audio streams were muted by Samsung when `LOCK_TASK_FEATURE_NONE` was set, which is more restrictive than Android's own default behavior
+  - `LOCK_TASK_FEATURE_GLOBAL_ACTIONS` is now included by default (matches Android's own default when `setLockTaskFeatures()` is never called), preventing Samsung/OneUI from muting audio in `LOCK_TASK_MODE_LOCKED`
+  - Added `AudioManager` safety net: after entering lock task mode, `setMasterVolumeMuted(false)` is called followed by `ADJUST_UNMUTE` on all audio streams (MUSIC, NOTIFICATION, ALARM, RING)
+  - **Settings UI change**: "Allow Power Menu" toggle renamed to "🔌 Block Power Menu" with inverted logic — power menu is now **allowed by default**, admin can explicitly block it if needed
+  - **No migration required**: same storage key `@kiosk_allow_power_button` — existing user settings preserved; only new installs benefit from the new default
+  - Applied consistently across `KioskModule.kt`, `MainActivity.kt`, and `AppLauncherModule.kt`
+- 🔧 **Camera/Microphone not working in WebView on Fire OS** (Echo Show, Fire tablets) (#63): auto-grant WebView media/geolocation permissions in kiosk mode — OS-level permission via `pm grant` still required
+
+
+***
+
+## [1.2.12] - 2026-02-18
+
+### Added
+- 🔒 **Screen lock without Device Owner**: `screen/off` and `lock` now work with Device Admin or AccessibilityService
+  - 4-tier fallback: Device Owner `lockNow()` → **Device Admin `lockNow()`** → AccessibilityService `GLOBAL_ACTION_LOCK_SCREEN` (API 28+) → dim brightness to 0
+  - `dpm.lockNow()` is available to Device Admin apps (API 8+), not just Device Owner — was an oversight
+  - Enables full FreeKiosk screen control when another MDM already holds Device Owner
+  - Truly turns off the screen (hardware off) with any of the 3 first tiers
+  - Wake-up cycle (`screen/on`, AlarmManager, WakeLock) unchanged and fully compatible
+  - `/api/lock` and `screen/off` response now includes `"method"` field (`"DeviceOwner"`, `"DeviceAdmin"`, or `"AccessibilityService"`)
+
+- **Inline PDF Viewer**: PDFs now open directly in-app via a bundled PDF.js viewer instead of being downloaded
+  - Enabled via a toggle in **Settings → General → PDF Viewer**
+  - Uses **PDF.js v3.11.174** bundled locally in Android assets — no Google Docs, no external service
+  - Full viewer UI: page navigation (◀/▶), zoom (−/⊡/+), close (✕), and download (⬇) buttons
+  - **Download button** triggers the native Android `DownloadManager` (notification + Downloads folder)
+  - Intercepts PDF links at 3 levels:
+    1. **JS injection**: strips `<a download>` attributes so Android's DownloadListener doesn't fire early
+    2. **`onShouldStartLoadWithRequest`**: redirects `.pdf` URLs and Google redirect URLs (`google.com/url?url=...`) to the viewer
+    3. **Native `DownloadListener` patch** (`RNCWebViewManagerImpl.kt`): intercepts PDFs detected by `Content-Type: application/pdf` or `Content-Disposition: attachment` and loads the viewer instead of downloading
+  - **Native HTTP proxy** (`RNCWebViewClient.java` `shouldInterceptRequest`): when the viewer is active, proxies all remote PDF XHR requests via `HttpURLConnection` to bypass CORS restrictions — cookies and `Range` headers forwarded
+  - Security: `allowFileAccess` / `allowUniversalAccessFromFileURLs` only enabled when PDF viewer is on
+  - All patches saved in `patches/react-native-webview+13.16.0.patch` via `patch-package`
+
+- ♿ **AccessibilityService for cross-app key injection**: New `FreeKioskAccessibilityService` enables keyboard emulation in External App mode
+  - Uses `performGlobalAction()` for Back/Home/Recents/PlayPause navigation (all Android versions)
+  - Uses `InputMethod.sendKeyEvent()` / `commitText()` for keys and text on Android 13+ (API 33+)
+  - **DPAD navigation fallback** (all Android versions): spatial focus traversal via accessibility tree,
+    `ACTION_CLICK` for select, `ACTION_SCROLL_FORWARD/BACKWARD` for scrolling
+  - **Play/Pause** mapped to `GLOBAL_ACTION_KEYCODE_HEADSETHOOK` (Android 12+)
+  - Fallback for Android 5–12: `ACTION_SET_TEXT` injects printable characters, text, Backspace, and Shift+letter
+  - `KeyCharacterMap` converts keyCodes to printable characters for the ACTION_SET_TEXT fallback
+  - 5-tier fallback chain: globalAction → InputMethod → a11y navigation → ACTION_SET_TEXT → `input keyevent`
+  - **Settings UI**: New "Accessibility Service" section in Advanced Settings with:
+    - Status indicator (Active / Enabled / Disabled)
+    - "Open Accessibility Settings" button to launch Android's settings
+    - "Enable Automatically" button for Device Owner mode (no user interaction needed)
+    - Info box explaining why the service is needed
+  - Compatible with privacy ROMs (e/OS, LineageOS, CalyxOS, GrapheneOS) where `Instrumentation` is blocked
+
+### Fixed
+- 🔊 **Volume buttons trigger PIN request when held** (#110): Holding the volume button to adjust volume would trigger the PIN request because both `MainActivity.onKeyDown` and `VolumeChangeReceiver` counted auto-repeat/rapid events as separate taps. Fixed by ignoring `KeyEvent` with `repeatCount > 0` in `MainActivity`, and adding a minimum 250ms interval between counted volume changes in `VolumeChangeReceiver` to filter out the rapid events (~50-100ms) generated by holding the button. Deliberate separate presses (>=250ms apart) still work normally. Reported by @Mkdir1511
+- 🔊 **Volume buttons trigger PIN request when held** (#110): Holding the volume button to adjust volume would trigger the PIN request because both `MainActivity.onKeyDown` and `VolumeChangeReceiver` counted auto-repeat/rapid events as separate taps. Fixed by ignoring `KeyEvent` with `repeatCount > 0` in `MainActivity`, and adding a minimum 250ms interval between counted volume changes in `VolumeChangeReceiver` to filter out the rapid events (~50-100ms) generated by holding the button. Deliberate separate presses (≥250ms apart) still work normally. Reported by @Mkdir1511
+- 🔑 **Key injection compatibility fix**: Replaced `Instrumentation.sendKeyDownUpSync()` with `activity.dispatchKeyEvent()` across all remote/keyboard endpoints
+  - `Instrumentation` requires `INJECT_EVENTS` (signature-level permission) which privacy-focused ROMs (e/OS, LineageOS, CalyxOS, GrapheneOS) block
+  - `dispatchKeyEvent()` dispatches directly into the Activity's View hierarchy — no special permission needed
+  - Affects: `/api/remote/*` (all 9 keys), `/api/remote/keyboard/{key}`, `/api/remote/keyboard?map=...`, `/api/remote/text`
+  - Also fixed in `KioskModule.sendRemoteKey()` (used by JS-side remote control)
+  - No regression on standard ROMs (Samsung, Pixel, AOSP)
+
+
+***
+
+## [1.2.11] - 2026-02-16
+
+### Added
+- ⌨️ **Keyboard Emulation API**: Full keyboard input simulation via REST API ([#keyboard](https://github.com/FreeKiosk/FreeKiosk/issues))
+  - **Single key press** (`GET|POST /api/remote/keyboard/{key}`): Send any keyboard key
+    - Supports: a-z, 0-9, F1-F12, space, tab, enter, escape, backspace, delete, arrows, symbols, media keys
+    - Over 80 named keys + single character support
+  - **Keyboard shortcuts** (`GET|POST /api/remote/keyboard?map=ctrl+c`): Send key combinations with modifiers
+    - Supports: ctrl, alt, shift, meta (Windows/Cmd key)
+    - Examples: `ctrl+c`, `ctrl+v`, `alt+f4`, `ctrl+shift+a`
+  - **Text input** (`POST /api/remote/text`): Type full text strings into focused input fields
+    - Body: `{"text": "Hello World!"}`
+    - Uses `Instrumentation.sendStringSync()` for natural text input
+  - All keyboard operations handled natively (no JS bridge — fast and reliable)
+- 📍 **GPS Location API** (`GET /api/location`): New endpoint for device GPS coordinates
+  - Returns: latitude, longitude, accuracy, altitude, speed, bearing, provider, timestamp
+  - Uses GPS, Network, and Passive location providers (best accuracy wins)
+  - Permissions already declared in manifest (`ACCESS_FINE_LOCATION` + `ACCESS_COARSE_LOCATION`)
+- 🔋 **Enriched Battery API**: `GET /api/battery` now returns additional data
+  - New fields: `temperature` (°C), `voltage` (V), `health` (good/overheat/dead/etc.), `technology` (Li-ion/etc.)
+  - Backward compatible: existing `level`, `charging`, `plugged` fields unchanged
+- 🔒 **Lock Device API** (`GET|POST /api/lock`): New endpoint to lock the device screen
+  - Uses `DevicePolicyManager.lockNow()` for a true screen lock (Device Owner required)
+  - Returns clear error message if Device Owner mode is not active
+- 🔄 **Restart UI API** (`GET|POST /api/restart-ui`): New endpoint to restart the app UI
+  - Calls `activity.recreate()` to fully restart the React Native activity
+  - Useful for remote troubleshooting without rebooting the device
+- 🗣️ **Text-to-Speech (TTS)**: Fully implemented native TTS via Android `TextToSpeech` engine
+  - TTS engine is initialized when the HTTP server starts
+  - Handled natively (no JS bridge dependency — works even if React Native is unresponsive)
+  - Auto-retries if TTS engine is not ready on first call
+- 📊 **Volume Read API** (`GET /api/volume`): New endpoint to read current volume level
+  - Returns `{ level: 0-100, maxLevel: 100 }` for easy integration with Home Assistant sensors
+
+### Fixed
+- 🔊 **Volume buttons trigger PIN request when held** (#110): Holding the volume button to adjust volume would trigger the PIN request because both `MainActivity.onKeyDown` and `VolumeChangeReceiver` counted auto-repeat/rapid events as separate taps. Fixed by ignoring `KeyEvent` with `repeatCount > 0` in `MainActivity`, and adding a minimum 250ms interval between counted volume changes in `VolumeChangeReceiver` to filter out the rapid events (~50-100ms) generated by holding the button. Deliberate separate presses (>=250ms apart) still work normally. Reported by @Mkdir1511
+- 🔊 **Volume buttons trigger PIN request when held** (#110): Holding the volume button to adjust volume would trigger the PIN request because both `MainActivity.onKeyDown` and `VolumeChangeReceiver` counted auto-repeat/rapid events as separate taps. Fixed by ignoring `KeyEvent` with `repeatCount > 0` in `MainActivity`, and adding a minimum 250ms interval between counted volume changes in `VolumeChangeReceiver` to filter out the rapid events (~50-100ms) generated by holding the button. Deliberate separate presses (≥250ms apart) still work normally. Reported by @Mkdir1511
+- 🐛 **Screen Sleep Scheduler - Black Screen & Navigation Lockout**: Fixed 4 critical bugs causing scheduler to malfunction
+  - **Feedback loop**: Scheduler re-entered sleep immediately after wake due to `isScheduledSleep` in useEffect dependency array
+  - **Navigation lockout**: Scheduler interval kept running while on PIN/Settings screen, calling `lockNow()` and locking user out
+  - **Wake-on-touch broken**: Touch events during sleep did nothing — never restored brightness or called `exitScheduledSleep()`
+  - **Stale closure**: `checkScreenSchedule()` used outdated state variable instead of ref
+  - **N-tap during sleep**: 5-tap for settings now properly exits scheduled sleep before navigating to PIN
+  - **Activity null after lockNow()**: `turnScreenOn()` now acquires WakeLock before checking for activity availability
+  - Fixes black screen issue on Android 8.1+ and impossible settings access during sleep windows
+- 🐛 **Power menu dismissed immediately on some devices (TECNO/HiOS)**: Fixed GlobalActions (power menu) being closed ~900ms after appearing when "Allow Power Button" is enabled in Lock Mode
+  - Root cause: `onWindowFocusChanged` aggressively re-applied immersive mode, stealing focus back from the system power menu window
+  - Additionally, `onResume` would re-trigger `startLockTask()` during the brief focus transition, compounding the issue
+  - Fix: debounced `hideSystemUI()` by 600ms on focus regain, and deferred `startLockTask()` re-lock when power button is allowed and focus was recently lost
+  - No security impact: Lock Task Mode remains fully active throughout — only the cosmetic immersive mode re-application is delayed
+  - Affects TECNO, Infinix, itel (HiOS) and potentially other OEMs with aggressive WindowManager behavior on Android 14+
+- 🐛 **Device Owner Status Hardcoded `false` in API**: Fixed `/api/info` and `/api/status` always reporting `isDeviceOwner: false`
+  - Was hardcoded to `false` in `HttpServerModule.getDeviceStatus()`
+  - Now performs a real `DevicePolicyManager.isDeviceOwnerApp()` check
+  - This caused external dashboards to incorrectly show Device Owner as inactive
+- 📺 **Screen On Not Working After lockNow()**: Fixed `GET /api/screen/on` failing when screen was off
+  - `reactContext.currentActivity` was `null` after `lockNow()` and the code silently did nothing
+  - WakeLock is now acquired **before** checking for activity (WakeLock works without activity)
+  - Added keyguard dismissal to properly wake from locked state
+  - Screen now reliably turns on whether activity is available or not
+- 🧹 **Clear Cache Now Actually Clears**: Fixed `/api/clearCache` which only reloaded the WebView
+  - Now performs a full native cache clear: WebView HTTP cache, cookies, Web Storage (localStorage/sessionStorage), form data
+  - Then forces a WebView remount on the JS side for a complete fresh start
+- 🔄 **In-App Update 404 Error**: Fixed update download failing with 404 error
+  - Now retrieves actual APK download URL from GitHub release assets instead of constructing it
+  - Eliminates filename case sensitivity issues (FreeKiosk vs freeKiosk)
+  - More robust: works regardless of APK naming convention changes
+  - Fallback to constructed URL if asset parsing fails
+- 📸 **Screenshot Race Condition**: Fixed `/api/screenshot` returning 503 intermittently
+  - Replaced `Thread.sleep(100)` with a proper `CountDownLatch` to wait for the UI thread
+  - Screenshot capture now waits up to 5 seconds for the UI thread to complete
+
+***
+
+## [1.2.10] - 2026-02-11
+
+### Added
+- ⏱️ **Inactivity Return - Scroll to Top Toggle**: New optional behavior for when already on start page
+  - Added "Scroll to Top on Start Page" toggle (enabled by default)
+  - When enabled and already on start page, smoothly scrolls to top instead of doing nothing
+- 🔗 **URL Filtering (Blacklist / Whitelist)**: Control which URLs users can navigate to within the kiosk WebView
+  - Choose between **Blacklist** mode (block specific URLs) or **Whitelist** mode (allow only specific URLs)
+  - Wildcard pattern support (e.g., `*.example.com/*`, `freekiosk.app/download`)
+  - Patterns without protocol are automatically matched with `http://` and `https://`
+  - Main kiosk URL is always protected and cannot be blocked
+  - Empty whitelist = strictest mode (only main URL allowed)
+  - Works with both traditional navigation and SPA/client-side routing (pushState)
+  - Optional visual feedback toast when a URL is blocked
+  - Popup/new window URLs are also filtered
+
+### Fixed
+- 🔊 **Volume buttons trigger PIN request when held** (#110): Holding the volume button to adjust volume would trigger the PIN request because both `MainActivity.onKeyDown` and `VolumeChangeReceiver` counted auto-repeat/rapid events as separate taps. Fixed by ignoring `KeyEvent` with `repeatCount > 0` in `MainActivity`, and adding a minimum 250ms interval between counted volume changes in `VolumeChangeReceiver` to filter out the rapid events (~50-100ms) generated by holding the button. Deliberate separate presses (>=250ms apart) still work normally. Reported by @Mkdir1511
+- 🔊 **Volume buttons trigger PIN request when held** (#110): Holding the volume button to adjust volume would trigger the PIN request because both `MainActivity.onKeyDown` and `VolumeChangeReceiver` counted auto-repeat/rapid events as separate taps. Fixed by ignoring `KeyEvent` with `repeatCount > 0` in `MainActivity`, and adding a minimum 250ms interval between counted volume changes in `VolumeChangeReceiver` to filter out the rapid events (~50-100ms) generated by holding the button. Deliberate separate presses (≥250ms apart) still work normally. Reported by @Mkdir1511
+- 🔗 **URL Filtering - Form Submits and JS Buttons**: Fixed form submissions and JavaScript buttons being blocked in whitelist mode
+  - Filter now compares origin + pathname instead of just origin
+  - Same-page navigations (query params, hash changes, form submits) are always allowed
+  - Trailing slashes are normalized (e.g., `https://example.com` and `https://example.com/` are treated as identical)
+  - Only navigation to different pages on the same domain requires whitelist match
+- 📡 **NFC Monitoring Fix**: Fixed "flicking back to blue screen" when NFC is enabled in kiosk mode
+  - Foreground monitoring detected transient `com.android.nfc` package as a wrong app and triggered a relaunch loop
+  - NFC system package is now filtered from monitoring checks only when NFC mode is active
+  - No impact on monitoring behavior when NFC is disabled
+- 💾 **Backup/Restore Missing Settings**: Fixed 20 settings keys not being included in export/import backups
+  - Added missing URL filtering settings (blacklist/whitelist lists and configuration)
+  - Added missing screen scheduler, inactivity return, blocking overlays settings
+  - Added missing WebView back button, camera position, return-to-settings preferences
+  - PIN mode setting now properly backed up and restored
+
+***
+
+## [1.2.9] - 2026-02-11
+
+### Fixed
+- 🔊 **Volume buttons trigger PIN request when held** (#110): Holding the volume button to adjust volume would trigger the PIN request because both `MainActivity.onKeyDown` and `VolumeChangeReceiver` counted auto-repeat/rapid events as separate taps. Fixed by ignoring `KeyEvent` with `repeatCount > 0` in `MainActivity`, and adding a minimum 250ms interval between counted volume changes in `VolumeChangeReceiver` to filter out the rapid events (~50-100ms) generated by holding the button. Deliberate separate presses (>=250ms apart) still work normally. Reported by @Mkdir1511
+- 🔊 **Volume buttons trigger PIN request when held** (#110): Holding the volume button to adjust volume would trigger the PIN request because both `MainActivity.onKeyDown` and `VolumeChangeReceiver` counted auto-repeat/rapid events as separate taps. Fixed by ignoring `KeyEvent` with `repeatCount > 0` in `MainActivity`, and adding a minimum 250ms interval between counted volume changes in `VolumeChangeReceiver` to filter out the rapid events (~50-100ms) generated by holding the button. Deliberate separate presses (≥250ms apart) still work normally. Reported by @Mkdir1511
+- 📱 **Status Bar Rotation Fix**: Fixed custom status bar disappearing after screen rotation in external app mode
+  - OverlayService now recreates the status bar overlay after configuration changes
+  - MainActivity re-hides Android system bars on rotation to prevent them from reappearing
+- 🔧 **Lock Mode "Device Owner not configured" False Warning**: Fixed JS bundle out of sync with native Kotlin module
+  - `startLockTask` call in bundled JS had 2 parameters instead of 3 (missing `allowNotifications`)
+  - React Native bridge could not match the method signature, causing a silent exception
+  - Resulted in false "Device Owner not configured" warning even when Device Owner was properly set
+- 🖱️ **5-Tap During Page Load**: Fixed 5-tap not working while WebView is loading or when page fails to load
+  - Invisible touch zone in bottom-right corner during loading and error states
+  - Tapping it counts as a 5-tap interaction, allowing access to settings even without network
+  - Touch zone disappears automatically once the page loads successfully (JS-based detection takes over)
+
+***
+
+## [1.2.8] - 2026-02-10
+
+### Added
+- 🖨️ **WebView Print Support**: Native Android printing via `window.print()` interception
+  - Supports all connected printers (WiFi, Bluetooth, USB, Cloud Print, PDF)
+- 🔗 **URL Filtering (Blacklist / Whitelist)**: Control which URLs users can navigate to
+  - Blacklist or Whitelist mode with wildcard pattern support
+  - Works with traditional navigation and SPA/client-side routing
+- ⬅️ **Back Button Mode via ADB**: `back_button_mode` parameter synced to native SharedPreferences
+- ⚠️ **Usage Stats Permission Warning**: Permission check and grant button in Settings
+
+### Fixed
+- 🔊 **Volume buttons trigger PIN request when held** (#110): Holding the volume button to adjust volume would trigger the PIN request because both `MainActivity.onKeyDown` and `VolumeChangeReceiver` counted auto-repeat/rapid events as separate taps. Fixed by ignoring `KeyEvent` with `repeatCount > 0` in `MainActivity`, and adding a minimum 250ms interval between counted volume changes in `VolumeChangeReceiver` to filter out the rapid events (~50-100ms) generated by holding the button. Deliberate separate presses (>=250ms apart) still work normally. Reported by @Mkdir1511
+- 🔊 **Volume buttons trigger PIN request when held** (#110): Holding the volume button to adjust volume would trigger the PIN request because both `MainActivity.onKeyDown` and `VolumeChangeReceiver` counted auto-repeat/rapid events as separate taps. Fixed by ignoring `KeyEvent` with `repeatCount > 0` in `MainActivity`, and adding a minimum 250ms interval between counted volume changes in `VolumeChangeReceiver` to filter out the rapid events (~50-100ms) generated by holding the button. Deliberate separate presses (≥250ms apart) still work normally. Reported by @Mkdir1511
+- 🔧 **Back Button Fix**: Fixed back button completely blocked when `test_mode=false`
+- 🔀 **ADB Config Fix**: `lock_package` now takes priority over `url` for display mode
+-  **Auto Launch on Boot Fix**: Fixed wrong AsyncStorage database name in native Kotlin files
+- 🔒 **Settings Buttons Fix**: Lock task temporarily stopped before opening system settings
+
+***
+
+## [1.2.7] - 2026-02-09
+
+### Fixed
+- 🔊 **Volume buttons trigger PIN request when held** (#110): Holding the volume button to adjust volume would trigger the PIN request because both `MainActivity.onKeyDown` and `VolumeChangeReceiver` counted auto-repeat/rapid events as separate taps. Fixed by ignoring `KeyEvent` with `repeatCount > 0` in `MainActivity`, and adding a minimum 250ms interval between counted volume changes in `VolumeChangeReceiver` to filter out the rapid events (~50-100ms) generated by holding the button. Deliberate separate presses (>=250ms apart) still work normally. Reported by @Mkdir1511
+- 🔊 **Volume buttons trigger PIN request when held** (#110): Holding the volume button to adjust volume would trigger the PIN request because both `MainActivity.onKeyDown` and `VolumeChangeReceiver` counted auto-repeat/rapid events as separate taps. Fixed by ignoring `KeyEvent` with `repeatCount > 0` in `MainActivity`, and adding a minimum 250ms interval between counted volume changes in `VolumeChangeReceiver` to filter out the rapid events (~50-100ms) generated by holding the button. Deliberate separate presses (≥250ms apart) still work normally. Reported by @Mkdir1511
+- **Navigation Buttons Blocked in Lock Mode**: Fixed navigation buttons (Home, Recents) not being properly blocked in kiosk lock mode
+  - Ensured `LOCK_TASK_FEATURE_NONE` correctly blocks all system navigation by default
+  - Only `GLOBAL_ACTIONS` (power button) and `NOTIFICATIONS` are conditionally enabled based on user settings
+  - Updated `hideSystemUI()` to use modern `WindowInsetsController` API for Android 11+ (API 30+)
+  - Added `SYSTEM_UI_FLAG_LOW_PROFILE` fallback for older Android versions
+
+***
+
+## [1.2.6] - 2026-02-09
+
+### Added
+- 🔍 **Background App Monitoring**: Auto-relaunch monitoring service for External App mode
+  - Automatically detects when locked app exits (crash, timeout, manual close)
+  - Brings FreeKiosk back to foreground and relaunches the external app
+  - Uses UsageStatsManager for accurate foreground detection (requires Device Owner or manual permission)
+  - Monitoring activates when auto-relaunch is enabled in settings
+  - Check every 2 seconds in background without impacting performance
+
+### Fixed
+- 🔊 **Volume buttons trigger PIN request when held** (#110): Holding the volume button to adjust volume would trigger the PIN request because both `MainActivity.onKeyDown` and `VolumeChangeReceiver` counted auto-repeat/rapid events as separate taps. Fixed by ignoring `KeyEvent` with `repeatCount > 0` in `MainActivity`, and adding a minimum 250ms interval between counted volume changes in `VolumeChangeReceiver` to filter out the rapid events (~50-100ms) generated by holding the button. Deliberate separate presses (>=250ms apart) still work normally. Reported by @Mkdir1511
+- 🔊 **Volume buttons trigger PIN request when held** (#110): Holding the volume button to adjust volume would trigger the PIN request because both `MainActivity.onKeyDown` and `VolumeChangeReceiver` counted auto-repeat/rapid events as separate taps. Fixed by ignoring `KeyEvent` with `repeatCount > 0` in `MainActivity`, and adding a minimum 250ms interval between counted volume changes in `VolumeChangeReceiver` to filter out the rapid events (~50-100ms) generated by holding the button. Deliberate separate presses (≥250ms apart) still work normally. Reported by @Mkdir1511
+- 🚀 **ADB Configuration Kiosk Mode**: Fixed kiosk mode not activating on first launch with `auto_start=true`
+  - External app now launches AFTER kiosk mode is properly activated
+  - Ensures lock task whitelist includes both FreeKiosk and external app before launch
+  - Proper restart sequence: save config → restart FreeKiosk → activate kiosk → launch app
+- 📡 **EXTERNAL_APP_LAUNCHED Broadcast**: Improved broadcast reliability for ADB monitoring
+  - Now verifies app is in foreground before broadcasting (up to 10 retries over 5 seconds)
+  - Adds `verified` boolean to broadcast extras to indicate foreground verification status
+  - Consistent behavior whether launched via ADB auto_start or normal app flow
+  - Better debugging with detailed logs showing retry attempts and current foreground app
+- 🌐 **REST API Reboot Endpoint**: Fixed `/api/reboot` not executing the reboot
+  - Reboot now runs natively via `DevicePolicyManager.reboot()` instead of through JS bridge
+  - No longer depends on React Native bridge being active (works with screen off)
+  - Returns clear error if app is not Device Owner
+- 🔀 **REST API Method Handling**: Control endpoints now accept both GET and POST
+  - Endpoints without body (`/api/screen/on`, `/api/reboot`, `/api/reload`, etc.) accept GET or POST
+  - Endpoints requiring body (`/api/url`, `/api/tts`, `/api/brightness`, etc.) remain POST-only
+  - Wrong method on POST-only endpoints now returns 405 "Method Not Allowed" instead of 404 "Not Found"
+
+***
+
+## [1.2.5] - 2026-02-06
+
+### Added
+- 📷 **Camera Photo API**: Take photos via REST endpoint using device cameras
+  - `GET /api/camera/photo?camera=back&quality=80` - Capture JPEG photo
+  - `GET /api/camera/list` - List available cameras with capabilities
+  - Supports front and back cameras with configurable JPEG quality (1-100)
+  - Auto-exposure and auto-focus warmup for optimal photo quality
+  - Optimized resolution (~1.2MP) for fast HTTP transfer
+  - Compatible with Home Assistant `camera` platform integration
+
+### Fixed
+- 🔊 **Volume buttons trigger PIN request when held** (#110): Holding the volume button to adjust volume would trigger the PIN request because both `MainActivity.onKeyDown` and `VolumeChangeReceiver` counted auto-repeat/rapid events as separate taps. Fixed by ignoring `KeyEvent` with `repeatCount > 0` in `MainActivity`, and adding a minimum 250ms interval between counted volume changes in `VolumeChangeReceiver` to filter out the rapid events (~50-100ms) generated by holding the button. Deliberate separate presses (>=250ms apart) still work normally. Reported by @Mkdir1511
+- 🔊 **Volume buttons trigger PIN request when held** (#110): Holding the volume button to adjust volume would trigger the PIN request because both `MainActivity.onKeyDown` and `VolumeChangeReceiver` counted auto-repeat/rapid events as separate taps. Fixed by ignoring `KeyEvent` with `repeatCount > 0` in `MainActivity`, and adding a minimum 250ms interval between counted volume changes in `VolumeChangeReceiver` to filter out the rapid events (~50-100ms) generated by holding the button. Deliberate separate presses (≥250ms apart) still work normally. Reported by @Mkdir1511
+- 🖼️ **Screensaver API State Separation**: Clarified screen status reporting in REST API
+  - GET `/api/screen` now separates physical screen state from screensaver overlay state
+  - `"on"`: Reports PHYSICAL screen state via PowerManager.isInteractive (true even if screensaver active)
+  - `"screensaverActive"`: Separate boolean indicating if screensaver overlay is showing
+  - Allows clients to distinguish: screen physically on vs content visible to user
+- 🔢 **Version Reporting**: API now dynamically reads version from BuildConfig instead of hardcoded value
+  - Automatically syncs with `versionName` in build.gradle
+  - No more manual updates needed when version changes
+  - Single source of truth for version information
+- 🔐 **PIN Input Stability**: Completely refactored PIN masking system for universal device compatibility
+  - Now uses native `secureTextEntry` instead of manual bullet masking
+  - Fixes duplicate/random character issues on certain Android devices/keyboards
+  - Eliminates input desynchronization problems
+  - Adds autocomplete prevention (`autoComplete="off"`, `textContentType="none"`, `importantForAutofill="no"`)
+
+***
+
+## [1.2.4] - 2026-02-05
+
+### Fixed
+- 🔊 **Volume buttons trigger PIN request when held** (#110): Holding the volume button to adjust volume would trigger the PIN request because both `MainActivity.onKeyDown` and `VolumeChangeReceiver` counted auto-repeat/rapid events as separate taps. Fixed by ignoring `KeyEvent` with `repeatCount > 0` in `MainActivity`, and adding a minimum 250ms interval between counted volume changes in `VolumeChangeReceiver` to filter out the rapid events (~50-100ms) generated by holding the button. Deliberate separate presses (>=250ms apart) still work normally. Reported by @Mkdir1511
+- 🔊 **Volume buttons trigger PIN request when held** (#110): Holding the volume button to adjust volume would trigger the PIN request because both `MainActivity.onKeyDown` and `VolumeChangeReceiver` counted auto-repeat/rapid events as separate taps. Fixed by ignoring `KeyEvent` with `repeatCount > 0` in `MainActivity`, and adding a minimum 250ms interval between counted volume changes in `VolumeChangeReceiver` to filter out the rapid events (~50-100ms) generated by holding the button. Deliberate separate presses (≥250ms apart) still work normally. Reported by @Mkdir1511
+- 📡 **HTTP Server Screen-Off Availability**: Fixed HTTP server becoming unreachable when screen is off
+  - Added `WifiLock (WIFI_MODE_FULL_HIGH_PERF)` to prevent WiFi from sleeping
+  - Added `PARTIAL_WAKE_LOCK` to keep CPU active for background HTTP processing
+  - Server now remains accessible 24/7 regardless of screen state
+  - Locks are automatically released when server stops to preserve battery
+- 🔒 **Blocking Overlay**: Bug fixes for blocking overlay display and behavior
+- 🔄 **Auto Relaunch External App**: Bug fixes for automatic external app relaunching
+
+***
+
+## [1.2.3] - 2026-01-30
+
+### Added
+- 📷 **Motion Detection Camera Selection**: Choose which camera to use for motion detection (front/back)
+- 🔘 **Flexible Settings Access Button**: Choose between fixed corner button or tap-anywhere mode for accessing settings
+- ⬅️ **WebView Back Button**: Optional back navigation button in WebView for easier browsing
+- ☀️ **Auto Brightness**: Automatic brightness adjustment based on ambient light sensor
+  - Configurable min/max brightness range
+
+### Changed
+- 🔒 **REST API Key Security**: Migrated API key storage from AsyncStorage to Android Keychain (encrypted)
+  - Automatic migration from previous versions (backward compatible)
+  - Backup/restore fully supports secure API key storage
+- 🔐 **Password System**: Enhanced flexibility with optional advanced mode
+  - Default: Numeric PIN (4-6 digits) - simple and fast
+  - Optional: Advanced Password Mode - enable alphanumeric passwords with letters, numbers, and special characters
+  - Toggle in Settings > Password > "Advanced Password Mode"
+
+### Fixed
+- 🔊 **Volume buttons trigger PIN request when held** (#110): Holding the volume button to adjust volume would trigger the PIN request because both `MainActivity.onKeyDown` and `VolumeChangeReceiver` counted auto-repeat/rapid events as separate taps. Fixed by ignoring `KeyEvent` with `repeatCount > 0` in `MainActivity`, and adding a minimum 250ms interval between counted volume changes in `VolumeChangeReceiver` to filter out the rapid events (~50-100ms) generated by holding the button. Deliberate separate presses (>=250ms apart) still work normally. Reported by @Mkdir1511
+- 🔊 **Volume buttons trigger PIN request when held** (#110): Holding the volume button to adjust volume would trigger the PIN request because both `MainActivity.onKeyDown` and `VolumeChangeReceiver` counted auto-repeat/rapid events as separate taps. Fixed by ignoring `KeyEvent` with `repeatCount > 0` in `MainActivity`, and adding a minimum 250ms interval between counted volume changes in `VolumeChangeReceiver` to filter out the rapid events (~50-100ms) generated by holding the button. Deliberate separate presses (≥250ms apart) still work normally. Reported by @Mkdir1511
+- 🎨 **Blocking Overlay Display**: Fixed display issues with blocking overlays
+- 🔄 **Auto Update System**: Fixed auto-update reliability issues
+
+
+***
+## [1.2.2] - 2026-01-21
+
+### Changed
+- 🎯 **5-Tap Detection System**: Complete redesign for fullscreen detection
+  - 5-tap now works **anywhere on the screen** (not just on button)
+  - Tap 5 times rapidly anywhere to access settings - no more corner targeting required
+  - Uses invisible 1x1 pixel overlay with `FLAG_WATCH_OUTSIDE_TOUCH` for fullscreen tap detection
+  - Visual indicator is now optional (can be hidden but 5-tap still works everywhere)
+  - Underlying app remains 100% interactive (no touch blocking)
+  - Removed button position settings (visual indicator fixed in bottom-right when visible)
+  - Same behavior in both WebView and External App modes
+
+### Added
+- 🔊 **Volume 5-Tap Gesture**: Alternative to 5tap for accessing PIN screen
+  - Press Volume Up or Volume Down 5 times quickly to access settings
+  - Works even when volume is at max (use Volume Down) or min (use Volume Up)
+  - Only active when kiosk mode (lock task) is enabled
+  - Toggle in Settings > Security > "Volume 5-Tap"
+- 🎨 **Blocking Overlay**: Configurable overlay to block user interactions
+  - Touch Logger countdown feature with coordinates display
+  - Configurable via settings
+
+### Fixed
+- 🔊 **Volume buttons trigger PIN request when held** (#110): Holding the volume button to adjust volume would trigger the PIN request because both `MainActivity.onKeyDown` and `VolumeChangeReceiver` counted auto-repeat/rapid events as separate taps. Fixed by ignoring `KeyEvent` with `repeatCount > 0` in `MainActivity`, and adding a minimum 250ms interval between counted volume changes in `VolumeChangeReceiver` to filter out the rapid events (~50-100ms) generated by holding the button. Deliberate separate presses (>=250ms apart) still work normally. Reported by @Mkdir1511
+- 🔊 **Volume buttons trigger PIN request when held** (#110): Holding the volume button to adjust volume would trigger the PIN request because both `MainActivity.onKeyDown` and `VolumeChangeReceiver` counted auto-repeat/rapid events as separate taps. Fixed by ignoring `KeyEvent` with `repeatCount > 0` in `MainActivity`, and adding a minimum 250ms interval between counted volume changes in `VolumeChangeReceiver` to filter out the rapid events (~50-100ms) generated by holding the button. Deliberate separate presses (≥250ms apart) still work normally. Reported by @Mkdir1511
+- 🖥️ **Screen On/Off API**: Improved reliability for `/api/screen/on` and `/api/screen/off`
+  - With Device Owner: uses `lockNow()` to truly turn off screen
+  - Without Device Owner: improved brightness control (0 instead of 0.01)
+  - Properly manages `FLAG_KEEP_SCREEN_ON` flag
+- 🔧 **React Native New Architecture**: Fixed compatibility issues with BroadcastReceivers
+- 🐛 **Screensaver Wake**: Fixed screensaver not waking properly after touch or motion detection (stale closure issue)
+- 🎨 **Visual Fixes**: 
+  - Added cursor visibility in text inputs (cursorColor and selectionColor)
+  - Updated "Launch on Boot" info message to apply to all users
+
+
+***
+
+
+## [1.2.1] - 2026-01-18
+
+### Added
+- 🔌 **ADB Configuration Support**: Headless provisioning via Android Debug Bridge
+  - Configure FreeKiosk via command line without UI interaction
+  - Set locked app, URL, and all kiosk settings via ADB
+  - Auto-restart and launch external app after configuration
+  - Support for full JSON configuration or individual parameters
+  - [Full ADB Documentation](docs/adb-configuration.md) with examples and scripts
+- � **Backup & Restore**: Export and import complete FreeKiosk configuration
+  - Export all settings to JSON file
+  - Import configuration from JSON file
+  - Perfect for device migration and configuration templates
+- �🔌 **Allow Power Button option**: New setting in Security tab to allow access to the power menu while in Lock Mode
+
+### Fixed
+- 🔊 **Volume buttons trigger PIN request when held** (#110): Holding the volume button to adjust volume would trigger the PIN request because both `MainActivity.onKeyDown` and `VolumeChangeReceiver` counted auto-repeat/rapid events as separate taps. Fixed by ignoring `KeyEvent` with `repeatCount > 0` in `MainActivity`, and adding a minimum 250ms interval between counted volume changes in `VolumeChangeReceiver` to filter out the rapid events (~50-100ms) generated by holding the button. Deliberate separate presses (>=250ms apart) still work normally. Reported by @Mkdir1511
+- 🔊 **Volume buttons trigger PIN request when held** (#110): Holding the volume button to adjust volume would trigger the PIN request because both `MainActivity.onKeyDown` and `VolumeChangeReceiver` counted auto-repeat/rapid events as separate taps. Fixed by ignoring `KeyEvent` with `repeatCount > 0` in `MainActivity`, and adding a minimum 250ms interval between counted volume changes in `VolumeChangeReceiver` to filter out the rapid events (~50-100ms) generated by holding the button. Deliberate separate presses (≥250ms apart) still work normally. Reported by @Mkdir1511
+- 🔧 **REST API Stability**: Improved server reliability and error handling
+- 🔧 **Hard restart boot behavior**: Fixed auto-launch issue after hard restart (power + volume buttons hold)
+- 🔧 **Database Synchronization**: Fixed data persistence with WAL checkpoint and file sync
+
+### Changed
+- 📖 **Documentation**: Updated FAQ for power button behavior and hard restart issues
+
+
+***
+
+
+## [1.2.0] - 2026-01-08
+
+
+### Added
+- 🎨 **Complete Settings UI Redesign**: Modern Material Design interface with organized tabs
+  - **4 organized tabs**: General, Display, Security, Advanced
+  - **Reusable UI components**: SettingsSection, SettingsSwitch, SettingsInput, SettingsRadioGroup, SettingsSlider, SettingsButton, SettingsInfoBox
+  - **Centralized theme system**: Colors, Spacing, Typography for consistent styling
+  - **Material Design Icons**: Professional vector icons throughout settings
+
+- 🔄 **URL Rotation**: Automatically cycle through multiple URLs at configurable intervals
+  - Add/edit/delete URLs with labels
+  - Reorder URLs with drag handles
+  - Set rotation interval (5+ seconds)
+  - REST API support for rotation control
+
+- 📅 **URL Planner**: Schedule URLs based on time and date
+  - **Recurring events**: Daily schedules with day-of-week selection
+  - **One-time events**: Specific date events for special occasions
+  - Set start/end times and priority levels
+  - Visual calendar-style management
+
+- 🌐 **REST API Server**: Built-in HTTP server for Home Assistant integration (40+ endpoints)
+  
+#### Sensor Endpoints (GET)
+- `/api/status` - Complete device status in one call
+- `/api/battery` - Battery level, charging state, temperature
+- `/api/brightness` - Current screen brightness
+- `/api/screen` - Screen on/off, screensaver state
+- `/api/sensors` - Light sensor, proximity sensor, accelerometer
+- `/api/storage` - Storage capacity and usage
+- `/api/memory` - RAM capacity and usage
+- `/api/wifi` - WiFi status, SSID, signal strength, IP
+- `/api/info` - Device model, Android version, app version
+- `/api/health` - Simple health check
+- `/api/screenshot` - Capture screen as PNG image
+
+#### Control Endpoints (POST)
+- `/api/brightness` - Set screen brightness (0-100)
+- `/api/screen/on` - Turn screen on
+- `/api/screen/off` - Turn screen off
+- `/api/screensaver/on` - Activate screensaver
+- `/api/screensaver/off` - Deactivate screensaver
+- `/api/reload` - Reload WebView
+- `/api/url` - Navigate to URL
+- `/api/wake` - Wake from screensaver
+- `/api/tts` - Text-to-speech
+- `/api/volume` - Set media volume
+- `/api/toast` - Show toast notification
+- `/api/js` - Execute JavaScript in WebView
+- `/api/clearCache` - Clear WebView cache
+- `/api/app/launch` - Launch external app
+- `/api/reboot` - Reboot device (Device Owner mode required)
+
+#### Audio Endpoints (POST)
+- `/api/audio/play` - Play audio from URL
+- `/api/audio/stop` - Stop audio playback
+- `/api/audio/beep` - Play beep sound
+
+#### Remote Control Endpoints (POST) - Android TV
+- `/api/remote/up` - D-pad up
+- `/api/remote/down` - D-pad down
+- `/api/remote/left` - D-pad left
+- `/api/remote/right` - D-pad right
+- `/api/remote/select` - Select/Enter
+- `/api/remote/back` - Back button
+- `/api/remote/home` - Home button
+- `/api/remote/menu` - Menu button
+- `/api/remote/playpause` - Play/Pause
+
+#### API Features
+- Optional API Key authentication (X-Api-Key header)
+- Configurable port (default: 8080)
+- Toggle remote control permissions
+- CORS support for web integration
+- JSON responses with timestamps
+
+### Documentation
+- 📖 New `docs/rest-api.md` with complete endpoint reference
+- 🏠 Home Assistant configuration examples
+- 🔧 cURL testing examples
+
+
+***
+
+
+## [1.1.4] - 2025-12-23
+
+
+### Added
+- 🔄 **In-App Direct Update for Device Owner**: Update FreeKiosk directly from within the app when in Device Owner mode
+- 🎨 **Status Bar Item Selection**: New settings to show/hide individual items (Home button, Time, Battery, WiFi, Bluetooth, Sound) in the status bar
+- 🧪 **Test Mode Options for External App**: Three options available
+  - **Test Mode**: Enable back button to return to FreeKiosk (default for safety)
+  - **Immediate Return**: 5-tap overlay button returns immediately to FreeKiosk
+  - **Delayed Return**: 5-tap overlay button with confirmation delay before returning
+
+
+### Fixed
+- 🔊 **Volume buttons trigger PIN request when held** (#110): Holding the volume button to adjust volume would trigger the PIN request because both `MainActivity.onKeyDown` and `VolumeChangeReceiver` counted auto-repeat/rapid events as separate taps. Fixed by ignoring `KeyEvent` with `repeatCount > 0` in `MainActivity`, and adding a minimum 250ms interval between counted volume changes in `VolumeChangeReceiver` to filter out the rapid events (~50-100ms) generated by holding the button. Deliberate separate presses (>=250ms apart) still work normally. Reported by @Mkdir1511
+- 🔊 **Volume buttons trigger PIN request when held** (#110): Holding the volume button to adjust volume would trigger the PIN request because both `MainActivity.onKeyDown` and `VolumeChangeReceiver` counted auto-repeat/rapid events as separate taps. Fixed by ignoring `KeyEvent` with `repeatCount > 0` in `MainActivity`, and adding a minimum 250ms interval between counted volume changes in `VolumeChangeReceiver` to filter out the rapid events (~50-100ms) generated by holding the button. Deliberate separate presses (≥250ms apart) still work normally. Reported by @Mkdir1511
+- 🐛 **Status Bar Position in External App Mode**: Status bar now properly sticks to the top of the screen
+- 🐛 **Clock Visibility**: Fixed issue with time display not showing correctly
+
+
+***
+
+
+## [1.1.3] - 2025-12-21
+
+
+### Added
+- ⌨️ **Keyboard Mode**: New option to control keyboard behavior
+  - Default: Use system default keyboard
+  - Force Numeric: Always show numeric keyboard
+  - Smart Detection: Automatically detect input type and show appropriate keyboard
+- 📊 **Status Bar Options for External App Mode**: New sub-options for status bar placement
+  - "On External App (Overlay)" - Show custom status bar overlay on top of the external app
+  - "On Return Screen" - Show status bar on the "External App Running" screen
+
+
+### Fixed
+- 🔊 **Volume buttons trigger PIN request when held** (#110): Holding the volume button to adjust volume would trigger the PIN request because both `MainActivity.onKeyDown` and `VolumeChangeReceiver` counted auto-repeat/rapid events as separate taps. Fixed by ignoring `KeyEvent` with `repeatCount > 0` in `MainActivity`, and adding a minimum 250ms interval between counted volume changes in `VolumeChangeReceiver` to filter out the rapid events (~50-100ms) generated by holding the button. Deliberate separate presses (>=250ms apart) still work normally. Reported by @Mkdir1511
+- 🔊 **Volume buttons trigger PIN request when held** (#110): Holding the volume button to adjust volume would trigger the PIN request because both `MainActivity.onKeyDown` and `VolumeChangeReceiver` counted auto-repeat/rapid events as separate taps. Fixed by ignoring `KeyEvent` with `repeatCount > 0` in `MainActivity`, and adding a minimum 250ms interval between counted volume changes in `VolumeChangeReceiver` to filter out the rapid events (~50-100ms) generated by holding the button. Deliberate separate presses (≥250ms apart) still work normally. Reported by @Mkdir1511
+- 🐛 **Status Bar System**: Debug and stability improvements for status bar display
+- 🐛 **PIN Code Max Failed Attempts**: Fixed issue with max failed attempts counter
+
+
+***
+
+
+## [1.1.2] - 2025-12-19
+
+
+### Added
+- 📊 **Status Bar Display**: New option to show/hide Android status bar (battery, WiFi, Bluetooth, sound)
+  - Configurable from settings screen
+  - Shows system status icons: battery level, WiFi connection, Bluetooth, volume, etc.
+  - Useful for monitoring device status without exiting kiosk mode
+- 🧪 **Test Mode for External App**: Safety feature for External App Mode
+  - Enabled by default for security
+  - Allows returning to FreeKiosk using Android back button
+  - Prevents accidental lockout during testing
+  - Can be disabled for production deployments
+
+
+***
+
+
+## [1.1.1] - 2025-12-16
+
+
+### Added
+- 👁️ **Overlay Button Visibility Toggle**: New option to show/hide the return button in External App Mode
+  - Button is invisible by default for maximum discretion
+  - Real-time opacity update when toggling visibility
+  - Button position configurable in settings (default: bottom-right)
+- 🗑️ **Device Owner Removal**: New button in Settings to remove Device Owner privileges
+  - Helps with uninstallation on Android 15+
+  - Automatically resets all settings after removal
+- 🔢 **Configurable PIN Attempts**: Set maximum PIN attempts between 1-100 (default: 5)
+- 🔐 **Hidden Default PIN Text**: "Default code: 1234" text now hidden when PIN is configured
+
+### Fixed
+- 🔊 **Volume buttons trigger PIN request when held** (#110): Holding the volume button to adjust volume would trigger the PIN request because both `MainActivity.onKeyDown` and `VolumeChangeReceiver` counted auto-repeat/rapid events as separate taps. Fixed by ignoring `KeyEvent` with `repeatCount > 0` in `MainActivity`, and adding a minimum 250ms interval between counted volume changes in `VolumeChangeReceiver` to filter out the rapid events (~50-100ms) generated by holding the button. Deliberate separate presses (>=250ms apart) still work normally. Reported by @Mkdir1511
+- 🔊 **Volume buttons trigger PIN request when held** (#110): Holding the volume button to adjust volume would trigger the PIN request because both `MainActivity.onKeyDown` and `VolumeChangeReceiver` counted auto-repeat/rapid events as separate taps. Fixed by ignoring `KeyEvent` with `repeatCount > 0` in `MainActivity`, and adding a minimum 250ms interval between counted volume changes in `VolumeChangeReceiver` to filter out the rapid events (~50-100ms) generated by holding the button. Deliberate separate presses (≥250ms apart) still work normally. Reported by @Mkdir1511
+- 🐛 **Critical: PIN Lockout Expiration**: PIN attempts now automatically reset after 1 hour of inactivity
+- 🐛 **Critical: PIN Attempts Persistence**: Expired PIN attempts are now properly saved to storage
+
+
+
+## [1.1.0] - 2025-12-11
+
+
+### Added
+- 📱 **External App Mode (Beta)**: Launch and lock any Android app instead of a WebView
+  - Select any installed app from a picker
+  - Floating overlay button with 5-tap return mechanism
+  - Auto-relaunch when user presses Home/Back buttons
+  - Full Device Owner lock task support for external apps
+- 🔒 **Enhanced Lock Task**: Whitelisted external apps in lock task mode
+- 🎯 **Auto-relaunch**: Configurable automatic app restart on exit attempts
+
+
+### Changed
+- 🏗️ Refactored kiosk architecture to support both WebView and External App modes
+- ⚡ Improved overlay service reliability and lifecycle management
+
+
+### Fixed
+- 🔊 **Volume buttons trigger PIN request when held** (#110): Holding the volume button to adjust volume would trigger the PIN request because both `MainActivity.onKeyDown` and `VolumeChangeReceiver` counted auto-repeat/rapid events as separate taps. Fixed by ignoring `KeyEvent` with `repeatCount > 0` in `MainActivity`, and adding a minimum 250ms interval between counted volume changes in `VolumeChangeReceiver` to filter out the rapid events (~50-100ms) generated by holding the button. Deliberate separate presses (>=250ms apart) still work normally. Reported by @Mkdir1511
+- 🔊 **Volume buttons trigger PIN request when held** (#110): Holding the volume button to adjust volume would trigger the PIN request because both `MainActivity.onKeyDown` and `VolumeChangeReceiver` counted auto-repeat/rapid events as separate taps. Fixed by ignoring `KeyEvent` with `repeatCount > 0` in `MainActivity`, and adding a minimum 250ms interval between counted volume changes in `VolumeChangeReceiver` to filter out the rapid events (~50-100ms) generated by holding the button. Deliberate separate presses (≥250ms apart) still work normally. Reported by @Mkdir1511
+- 🐛 Potential fix for infinite loading on login pages (cookie/session handling)
+
+
+***
+
+
+## [1.0.5] - 2025-11-26
+
+
+### Added
+- 🎥 Motion detection (Beta): Camera-based motion detection to exit screensaver mode
+- 🍪 Cookie management: Basic cookie handling via react-native-cookies for web session persistence
+
+
+### Changed
+- 🚀 WebView optimization: Performance improvements specifically for Fire OS tablets
+- 🔒 Enhanced WebView security: Additional security measures for safe web content display
+
+
+### Fixed
+- 🔊 **Volume buttons trigger PIN request when held** (#110): Holding the volume button to adjust volume would trigger the PIN request because both `MainActivity.onKeyDown` and `VolumeChangeReceiver` counted auto-repeat/rapid events as separate taps. Fixed by ignoring `KeyEvent` with `repeatCount > 0` in `MainActivity`, and adding a minimum 250ms interval between counted volume changes in `VolumeChangeReceiver` to filter out the rapid events (~50-100ms) generated by holding the button. Deliberate separate presses (>=250ms apart) still work normally. Reported by @Mkdir1511
+- 🔊 **Volume buttons trigger PIN request when held** (#110): Holding the volume button to adjust volume would trigger the PIN request because both `MainActivity.onKeyDown` and `VolumeChangeReceiver` counted auto-repeat/rapid events as separate taps. Fixed by ignoring `KeyEvent` with `repeatCount > 0` in `MainActivity`, and adding a minimum 250ms interval between counted volume changes in `VolumeChangeReceiver` to filter out the rapid events (~50-100ms) generated by holding the button. Deliberate separate presses (≥250ms apart) still work normally. Reported by @Mkdir1511
+- 🐛 WebView stability improvements on Fire OS devices
+
+
+***
+
+
+## [1.0.4] - 2025-11-19
+
+
+### Added
+- 🔆 Brightness control: Adjustable screen brightness slider in settings
+- 🌙 Screensaver mode: Configurable inactivity timer that dims screen to save power
+- 🎥 Camera permission: Added CAMERA permission for web apps requiring camera access
+- 🎤 Microphone permission: Added RECORD_AUDIO permission for web apps with audio features
+- 📍 Location permissions: Added ACCESS_FINE_LOCATION and ACCESS_COARSE_LOCATION for location-based web apps
+- 📁 Storage permissions: Added READ_EXTERNAL_STORAGE and WRITE_EXTERNAL_STORAGE for file access support
+
+
+***
+
+
+## [1.0.3] - 2025-11-17
+
+
+### Added
+- 🚀 Auto-launch toggle: Enable/disable automatic app launch at device boot
+- 💡 Screen always-on feature: Keep screen awake while app is running
+
+
+### Changed
+- 🔧 Improved Device Owner auto-launch handling with preference-based control
+- 📱 Enhanced boot receiver logic to respect user auto-launch preference
+
+
+***
+
+
+## [1.0.2] - 2025-11-13
+
+
+### Added
+- ⚙️ Configuration access button on main screen for improved first-time user experience
+- 🔒 HTTPS self-signed certificate security prompt (accept/reject before proceeding)
+- 🗑️ Clear trusted certificates option in Reset All Settings
+
+
+### Changed
+- 📱 Improved Play Store compliance for SSL certificate handling
+
+
+### Fixed
+- 🔊 **Volume buttons trigger PIN request when held** (#110): Holding the volume button to adjust volume would trigger the PIN request because both `MainActivity.onKeyDown` and `VolumeChangeReceiver` counted auto-repeat/rapid events as separate taps. Fixed by ignoring `KeyEvent` with `repeatCount > 0` in `MainActivity`, and adding a minimum 250ms interval between counted volume changes in `VolumeChangeReceiver` to filter out the rapid events (~50-100ms) generated by holding the button. Deliberate separate presses (>=250ms apart) still work normally. Reported by @Mkdir1511
+- 🔊 **Volume buttons trigger PIN request when held** (#110): Holding the volume button to adjust volume would trigger the PIN request because both `MainActivity.onKeyDown` and `VolumeChangeReceiver` counted auto-repeat/rapid events as separate taps. Fixed by ignoring `KeyEvent` with `repeatCount > 0` in `MainActivity`, and adding a minimum 250ms interval between counted volume changes in `VolumeChangeReceiver` to filter out the rapid events (~50-100ms) generated by holding the button. Deliberate separate presses (≥250ms apart) still work normally. Reported by @Mkdir1511
+- 🔐 Self-signed certificates now require explicit user confirmation (browser-like behavior)
+
+
+***
+
+
+## [1.0.1] - 2025-10-30
+
+
+### Added
+- 🎉 Initial public release of FreeKiosk
+- ✅ Full kiosk mode with Device Owner support
+- ✅ Optional screen pinning toggle (ON/OFF in settings)
+- ✅ WebView display for any URL
+- ✅ HTTPS self-signed certificate support
+- ✅ Password protection (4+ characters, alphanumeric support)
+- ✅ Reset settings button (clear all config from app)
+- ✅ Settings screen with URL and PIN configuration
+- ✅ Auto-start on device boot
+- ✅ Samsung popup blocking (Device Owner mode)
+- ✅ Exit kiosk mode button
+- ✅ Immersive fullscreen mode
+- ✅ Lock task mode support
+- ✅ System apps suspension (Device Owner mode)
+- ✅ React Native 0.75 with TypeScript
+- ✅ Kotlin native modules
+- ✅ Compatible Android 8.0+ (API 26+)
+- ✅ English language UI (default)
+
+
+### Documentation
+- 📝 Complete README with installation guide
+- 📝 Device Owner setup instructions
+- 📝 FAQ document
+- 📝 MIT License
+
+
+***
+
+
+## [Unreleased]
+
+
+### Planned for v1.2.0
+- Multi-language support (French, Spanish, German)
+- Multiple URL rotation
+- Scheduled URL changes
+- Motion detection via camera
+- Auto-brightness scheduling
+
+
+### Planned for v2.0.0
+- FreeKiosk Cloud (MDM Dashboard)
+- Remote device configuration
+- Multi-device management
+- Analytics and monitoring
+
+
+***
+
+
+[1.2.19]: https://github.com/rushb-fr/freekiosk/releases/tag/v1.2.19
+[1.2.18]: https://github.com/rushb-fr/freekiosk/releases/tag/v1.2.18
+[1.2.17]: https://github.com/rushb-fr/freekiosk/releases/tag/v1.2.17
+[1.2.16]: https://github.com/rushb-fr/freekiosk/releases/tag/v1.2.16
+[1.2.15]: https://github.com/rushb-fr/freekiosk/releases/tag/v1.2.15
+[1.2.14]: https://github.com/rushb-fr/freekiosk/releases/tag/v1.2.14
+[1.2.13]: https://github.com/rushb-fr/freekiosk/releases/tag/v1.2.13
+[1.2.12]: https://github.com/rushb-fr/freekiosk/releases/tag/v1.2.12
+[1.2.11]: https://github.com/rushb-fr/freekiosk/releases/tag/v1.2.11
+[1.2.10]: https://github.com/rushb-fr/freekiosk/releases/tag/v1.2.10
+[1.2.9]: https://github.com/rushb-fr/freekiosk/releases/tag/v1.2.9
+[1.2.8]: https://github.com/rushb-fr/freekiosk/releases/tag/v1.2.8
+[1.2.7]: https://github.com/rushb-fr/freekiosk/releases/tag/v1.2.7
+[1.2.6]: https://github.com/rushb-fr/freekiosk/releases/tag/v1.2.6
+[1.2.5]: https://github.com/rushb-fr/freekiosk/releases/tag/v1.2.5
+[1.2.4]: https://github.com/rushb-fr/freekiosk/releases/tag/v1.2.4
+[1.2.3]: https://github.com/rushb-fr/freekiosk/releases/tag/v1.2.3
+[1.2.2]: https://github.com/rushb-fr/freekiosk/releases/tag/v1.2.2
+[1.2.1]: https://github.com/rushb-fr/freekiosk/releases/tag/v1.2.1
+[1.2]: https://github.com/rushb-fr/freekiosk/releases/tag/v1.2
+[1.1.4]: https://github.com/rushb-fr/freekiosk/releases/tag/v1.1.4
+[1.1.3]: https://github.com/rushb-fr/freekiosk/releases/tag/v1.1.3
+[1.1.2]: https://github.com/rushb-fr/freekiosk/releases/tag/v1.1.2
+[1.1.1]: https://github.com/rushb-fr/freekiosk/releases/tag/v1.1.1
+[1.1.0]: https://github.com/rushb-fr/freekiosk/releases/tag/v1.1.0
+[1.0.5]: https://github.com/rushb-fr/freekiosk/releases/tag/v1.0.5
+[1.0.4]: https://github.com/rushb-fr/freekiosk/releases/tag/v1.0.4
+[1.0.3]: https://github.com/rushb-fr/freekiosk/releases/tag/v1.0.3
+[1.0.2]: https://github.com/rushb-fr/freekiosk/releases/tag/v1.0.2
+[1.0.1]: https://github.com/rushb-fr/freekiosk/releases/tag/v1.0.1
+[Unreleased]: https://github.com/rushb-fr/freekiosk/compare/v1.2.19...HEAD

@@ -1,0 +1,459 @@
+/**
+ * ApiService.ts
+ * Service pour connecter l'API REST à l'application React Native
+ * Gère les commandes reçues et fournit le statut en temps réel
+ */
+
+import { DeviceEventEmitter, NativeModules, NativeEventEmitter, Platform } from 'react-native';
+import { httpServer } from './HttpServerModule';
+import { mqttClient } from './MqttModule';
+import { StorageService } from './storage';
+import { getSecureMqttPassword } from './secureStorage';
+
+const { HttpServerModule, MqttModule } = NativeModules;
+
+export interface ApiCallbacks {
+  onSetBrightness?: (value: number) => void;
+  onScreenOn?: () => void;
+  onScreenOff?: () => void;
+  onScreensaverOn?: () => void;
+  onScreensaverOff?: () => void;
+  onScreensaverWakeContentOn?: () => void;
+  onScreensaverWakeContentOff?: () => void;
+  onWake?: () => void;
+  onReload?: () => void;
+  onSetUrl?: (url: string) => void;
+  onTts?: (text: string) => void;
+  onSetVolume?: (value: number) => void;
+  onRotationStart?: () => void;
+  onRotationStop?: () => void;
+  onToast?: (text: string) => void;
+  onLaunchApp?: (packageName: string) => void;
+  onExecuteJs?: (code: string) => void;
+  onReboot?: () => void;
+  onShutdown?: () => void;
+  onClearCache?: () => void;
+  onRemoteKey?: (key: string) => void;
+  onAutoBrightnessEnable?: (min: number, max: number, offset?: number) => void;
+  onAutoBrightnessDisable?: () => void;
+  onSetMotionAlwaysOn?: (value: boolean) => void;
+  onSetMode?: (mode: 'webview' | 'external_app', target?: string) => void;
+  onWebViewBack?: () => void;
+  onWebViewForward?: () => void;
+  onWebViewScrollTop?: () => void;
+  onGoHome?: () => void;
+  onInjectCss?: (css: string) => void;
+  onInjectJs?: (code: string, persistent: boolean) => void;
+  onSetBanner?: (enabled: boolean, text: string, fontSize: number, showIcon: boolean) => void;
+  onHideBanner?: () => void;
+}
+
+export interface AppStatus {
+  currentUrl: string;
+  canGoBack: boolean;
+  loading: boolean;
+  brightness: number;
+  screensaverActive: boolean;
+  screenOn?: boolean; // Track actual screen state (from power button)
+  kioskMode: boolean;
+  volume?: number;
+  rotationEnabled?: boolean;
+  rotationUrls?: string[];
+  rotationInterval?: number;
+  rotationCurrentIndex?: number;
+  autoBrightnessEnabled?: boolean;
+  autoBrightnessMin?: number;
+  autoBrightnessMax?: number;
+  scheduledSleep?: boolean;
+  motionDetected?: boolean;
+  motionAlwaysOn?: boolean;
+}
+
+class ApiServiceClass {
+  private callbacks: ApiCallbacks = {};
+  private eventEmitter: NativeEventEmitter | null = null;
+  private commandSubscription: any = null;
+  private appStatus: AppStatus = {
+    currentUrl: '',
+    canGoBack: false,
+    loading: false,
+    brightness: 50,
+    screensaverActive: false,
+    screenOn: true, // Assume screen is ON by default
+    kioskMode: false,
+    scheduledSleep: false,
+    motionDetected: false,
+  };
+  private isInitialized = false;
+
+  /**
+   * Initialize the API service and start listening for commands
+   */
+  async initialize(callbacks: ApiCallbacks): Promise<void> {
+    if (this.isInitialized) {
+      console.log('ApiService: Already initialized');
+      return;
+    }
+
+    this.callbacks = callbacks;
+
+    if (Platform.OS === 'android' && HttpServerModule) {
+      this.eventEmitter = new NativeEventEmitter(HttpServerModule);
+      
+      // Listen for API commands from native module
+      // Defer to next tick to avoid CalledFromWrongThreadException
+      // when react-native-screens manipulates views during commit on native thread
+      this.commandSubscription = this.eventEmitter.addListener(
+        'onApiCommand',
+        (event: { command: string; params: string }) => {
+          setTimeout(() => this.handleCommand(event), 0);
+        }
+      );
+
+      console.log('ApiService: Initialized and listening for commands');
+    }
+
+    this.isInitialized = true;
+  }
+
+  /**
+   * Start the API server if enabled in settings
+   */
+  async autoStart(): Promise<void> {
+    try {
+      const enabled = await StorageService.getRestApiEnabled();
+      if (!enabled) {
+        console.log('ApiService: REST API disabled in settings');
+        return;
+      }
+
+      const port = await StorageService.getRestApiPort();
+      const apiKey = await StorageService.getRestApiKey();
+      const allowControl = await StorageService.getRestApiAllowControl();
+
+      const result = await httpServer.startServer(port, apiKey || null, allowControl);
+      console.log(`ApiService: Server started on ${result.ip}:${result.port}`);
+    } catch (error) {
+      console.error('ApiService: Failed to auto-start server', error);
+    }
+  }
+
+  /**
+   * Start the MQTT client if enabled in settings
+   */
+  async autoStartMqtt(): Promise<void> {
+    const enabled = await StorageService.getMqttEnabled();
+    if (!enabled) {
+      throw new Error('MQTT is not enabled');
+    }
+
+    const brokerUrl = await StorageService.getMqttBrokerUrl();
+    if (!brokerUrl) {
+      throw new Error('Broker URL not configured');
+    }
+
+    const port = await StorageService.getMqttPort();
+    const username = await StorageService.getMqttUsername();
+    const password = await getSecureMqttPassword();
+    const clientId = await StorageService.getMqttClientId();
+    const baseTopic = await StorageService.getMqttBaseTopic();
+    const discoveryPrefix = await StorageService.getMqttDiscoveryPrefix();
+    const statusInterval = await StorageService.getMqttStatusInterval();
+    const allowControl = await StorageService.getMqttAllowControl();
+    const deviceName = await StorageService.getMqttDeviceName();
+
+    await mqttClient.start({
+      brokerUrl,
+      port,
+      username: username || undefined,
+      password: password || undefined,
+      clientId: clientId || undefined,
+      baseTopic,
+      discoveryPrefix,
+      statusInterval: statusInterval * 1000, // Convert seconds to ms
+      allowControl,
+      deviceName: deviceName || undefined,
+      useTls: port === 8883,
+    });
+
+    console.log(`ApiService: MQTT client started for ${brokerUrl}:${port}`);
+  }
+
+  /**
+   * Stop MQTT client
+   */
+  async stopMqtt(): Promise<void> {
+    try {
+      await mqttClient.stop();
+      console.log('ApiService: MQTT client stopped');
+    } catch (error) {
+      console.error('ApiService: Failed to stop MQTT', error);
+    }
+  }
+
+  /**
+   * Handle incoming API commands
+   */
+  private handleCommand(event: { command: string; params: string }): void {
+    console.log('ApiService: Received command', event.command);
+    
+    try {
+      const params = JSON.parse(event.params || '{}');
+      
+      switch (event.command) {
+        case 'setBrightness':
+          if (this.callbacks.onSetBrightness && params.value !== undefined) {
+            this.callbacks.onSetBrightness(params.value);
+          }
+          break;
+          
+        case 'screenOn':
+          if (this.callbacks.onScreenOn) {
+            this.callbacks.onScreenOn();
+          }
+          break;
+          
+        case 'screenOff':
+          if (this.callbacks.onScreenOff) {
+            this.callbacks.onScreenOff();
+          }
+          break;
+          
+        case 'screensaverOn':
+          if (this.callbacks.onScreensaverOn) {
+            this.callbacks.onScreensaverOn();
+          }
+          break;
+          
+        case 'screensaverOff':
+          if (this.callbacks.onScreensaverOff) {
+            this.callbacks.onScreensaverOff();
+          }
+          break;
+          
+        case 'screensaverWakeContentOn':
+          if (this.callbacks.onScreensaverWakeContentOn) {
+            this.callbacks.onScreensaverWakeContentOn();
+          }
+          break;
+          
+        case 'screensaverWakeContentOff':
+          if (this.callbacks.onScreensaverWakeContentOff) {
+            this.callbacks.onScreensaverWakeContentOff();
+          }
+          break;
+          
+        case 'wake':
+          if (this.callbacks.onWake) {
+            this.callbacks.onWake();
+          }
+          break;
+          
+        case 'reload':
+          if (this.callbacks.onReload) {
+            this.callbacks.onReload();
+          }
+          break;
+          
+        case 'setUrl':
+          if (this.callbacks.onSetUrl && params.url) {
+            this.callbacks.onSetUrl(params.url);
+          }
+          break;
+          
+        case 'tts':
+          if (this.callbacks.onTts && params.text) {
+            this.callbacks.onTts(params.text);
+          }
+          break;
+          
+        case 'setVolume':
+          if (this.callbacks.onSetVolume && params.value !== undefined) {
+            this.callbacks.onSetVolume(params.value);
+          }
+          break;
+          
+        case 'rotationStart':
+          if (this.callbacks.onRotationStart) {
+            this.callbacks.onRotationStart();
+          }
+          break;
+          
+        case 'rotationStop':
+          if (this.callbacks.onRotationStop) {
+            this.callbacks.onRotationStop();
+          }
+          break;
+          
+        case 'toast':
+          if (this.callbacks.onToast && params.text) {
+            this.callbacks.onToast(params.text);
+          }
+          break;
+          
+        case 'launchApp':
+          if (this.callbacks.onLaunchApp && params.package) {
+            this.callbacks.onLaunchApp(params.package);
+          }
+          break;
+          
+        case 'executeJs':
+          if (this.callbacks.onExecuteJs && params.code) {
+            this.callbacks.onExecuteJs(params.code);
+          }
+          break;
+          
+        case 'reboot':
+          if (this.callbacks.onReboot) {
+            this.callbacks.onReboot();
+          }
+          break;
+          
+        case 'shutdown':
+          if (this.callbacks.onShutdown) {
+            this.callbacks.onShutdown();
+          }
+          break;
+          
+        case 'clearCache':
+          if (this.callbacks.onClearCache) {
+            this.callbacks.onClearCache();
+          }
+          break;
+          
+        case 'remoteKey':
+          if (this.callbacks.onRemoteKey && params.key) {
+            this.callbacks.onRemoteKey(params.key);
+          }
+          break;
+          
+        case 'autoBrightnessEnable':
+          if (this.callbacks.onAutoBrightnessEnable) {
+            const min = params.min !== undefined ? params.min : 10;
+            const max = params.max !== undefined ? params.max : 100;
+            const offset = params.offset !== undefined ? params.offset : undefined;
+            this.callbacks.onAutoBrightnessEnable(min, max, offset);
+          }
+          break;
+          
+        case 'autoBrightnessDisable':
+          if (this.callbacks.onAutoBrightnessDisable) {
+            this.callbacks.onAutoBrightnessDisable();
+          }
+          break;
+
+        case 'setMotionAlwaysOn':
+          if (this.callbacks.onSetMotionAlwaysOn) {
+            this.callbacks.onSetMotionAlwaysOn(params.value === true);
+          }
+          break;
+
+        case 'setMode':
+          if (this.callbacks.onSetMode && (params.mode === 'webview' || params.mode === 'external_app')) {
+            const target = params.url || params.package || undefined;
+            this.callbacks.onSetMode(params.mode, target);
+          }
+          break;
+
+        case 'webviewBack':
+          if (this.callbacks.onWebViewBack) {
+            this.callbacks.onWebViewBack();
+          }
+          break;
+
+        case 'webviewForward':
+          if (this.callbacks.onWebViewForward) {
+            this.callbacks.onWebViewForward();
+          }
+          break;
+
+        case 'webviewScrollTop':
+          if (this.callbacks.onWebViewScrollTop) {
+            this.callbacks.onWebViewScrollTop();
+          }
+          break;
+
+        case 'goHome':
+          if (this.callbacks.onGoHome) {
+            this.callbacks.onGoHome();
+          }
+          break;
+
+        case 'injectCss':
+          if (this.callbacks.onInjectCss && params.css) {
+            this.callbacks.onInjectCss(params.css);
+          }
+          break;
+
+        case 'injectJs':
+          if (this.callbacks.onInjectJs && params.code) {
+            this.callbacks.onInjectJs(params.code, params.persistent === true);
+          }
+          break;
+
+        case 'set_banner':
+          if (this.callbacks.onSetBanner) {
+            this.callbacks.onSetBanner(
+              params.banner_enabled === true || params.banner_enabled === 'true',
+              params.banner_text || 'Diebstahl zwecklos. Das Tablet funktioniert nur in der Praxis.',
+              parseFloat(params.banner_font_size) || 14,
+              params.banner_show_icon !== false && params.banner_show_icon !== 'false',
+            );
+          }
+          break;
+
+        case 'hide_banner':
+          if (this.callbacks.onHideBanner) {
+            this.callbacks.onHideBanner();
+          }
+          break;
+
+        default:
+          console.warn('ApiService: Unknown command', event.command);
+      }
+    } catch (error) {
+      console.error('ApiService: Error handling command', error);
+    }
+  }
+
+  /**
+   * Update app status (call this from KioskScreen when state changes)
+   * Forwards to both HTTP server and MQTT client native modules
+   */
+  updateStatus(status: Partial<AppStatus>): void {
+    this.appStatus = { ...this.appStatus, ...status };
+
+    const statusJson = JSON.stringify(this.appStatus);
+
+    // Send to HTTP server native module
+    if (HttpServerModule?.updateStatus) {
+      HttpServerModule.updateStatus(statusJson);
+    }
+
+    // Send to MQTT native module
+    if (MqttModule?.updateStatus) {
+      MqttModule.updateStatus(statusJson);
+    }
+  }
+
+  /**
+   * Get current app status
+   */
+  getStatus(): AppStatus {
+    return this.appStatus;
+  }
+
+  /**
+   * Cleanup
+   */
+  destroy(): void {
+    if (this.commandSubscription) {
+      this.commandSubscription.remove();
+      this.commandSubscription = null;
+    }
+    this.isInitialized = false;
+    console.log('ApiService: Destroyed');
+  }
+}
+
+export const ApiService = new ApiServiceClass();
